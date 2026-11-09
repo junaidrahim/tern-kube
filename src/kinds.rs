@@ -111,6 +111,12 @@ const fn num(id: &'static str, head: &'static str, priority: f64) -> ColSpec {
 const NAME: ColSpec = ColSpec { id: "name", head: "Name", numeric: false, grow: true, priority: 100.0 };
 const NS: ColSpec = col("namespace", "Namespace", 40.0);
 const AGE: ColSpec = num("age", "Age", 60.0);
+/// The context column of merged tables.
+pub const CONTEXT: ColSpec = col("context", "Context", 85.0);
+/// Metrics columns of pods and nodes.
+pub const CPU: ColSpec = num("cpu", "CPU", 36.0);
+/// Metrics columns of pods and nodes.
+pub const MEMORY: ColSpec = num("memory", "Memory", 35.0);
 
 impl Projector {
 	/// The columns, without Namespace (added for namespaced kinds).
@@ -275,6 +281,39 @@ impl Kind {
 	/// Whether the object kind has pods with logs and a shell.
 	pub fn is_pod(&self) -> bool {
 		self.projector == Projector::Pod
+	}
+
+	/// Has a scale subresource the UI offers.
+	pub fn scalable(&self) -> bool {
+		matches!(self.projector, Projector::Deployment | Projector::StatefulSet | Projector::ReplicaSet)
+	}
+
+	/// Supports `rollout restart`.
+	pub fn restartable(&self) -> bool {
+		matches!(self.projector, Projector::Deployment | Projector::StatefulSet | Projector::DaemonSet)
+	}
+
+	/// Owns or selects pods (child pods, aggregated logs).
+	pub fn selects_pods(&self) -> bool {
+		matches!(
+			self.projector,
+			Projector::Deployment
+				| Projector::StatefulSet
+				| Projector::DaemonSet
+				| Projector::ReplicaSet
+				| Projector::Job
+				| Projector::Service
+		)
+	}
+
+	/// Has a Logs tab (its own pod, or the pods it selects).
+	pub fn has_logs(&self) -> bool {
+		self.is_pod() || self.selects_pods()
+	}
+
+	/// Shows CPU and memory.
+	pub fn has_metrics(&self) -> bool {
+		matches!(self.projector, Projector::Pod | Projector::Node)
 	}
 }
 

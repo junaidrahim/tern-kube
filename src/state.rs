@@ -6,9 +6,12 @@ use serde::{Deserialize, Serialize};
 
 /// What is saved.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Saved {
-	/// Last context.
+	/// Last primary context.
 	pub context:   Option<String>,
+	/// Every context shown (the primary first).
+	pub contexts:  Vec<String>,
 	/// Last kind id.
 	pub kind:      Option<String>,
 	/// Last namespace filter.

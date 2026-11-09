@@ -7,7 +7,7 @@ use kube::api::DynamicObject;
 use serde_json::Value;
 use tern_sdk::ui::Tone;
 
-use crate::{format, kinds::Projector};
+use crate::{format, kinds::Projector, metrics};
 
 /// A cell value.
 #[derive(Clone, Debug, PartialEq)]
@@ -64,6 +64,8 @@ pub struct Row {
 	pub cells:     Vec<(&'static str, Val)>,
 	/// Lowercase fields joined by newlines, for the filter.
 	pub haystack:  String,
+	/// Requests and limits (pods) or allocatable (nodes), for metrics cells.
+	pub res:       Option<metrics::Resources>,
 }
 
 impl Row {
@@ -462,7 +464,12 @@ pub fn project(projector: Projector, obj: &DynamicObject) -> Row {
 	if let Some(uid) = &meta.uid {
 		haystack.push_str(uid);
 	}
-	Row { key: key_of(obj), namespace, cells, haystack }
+	let res = match projector {
+		Projector::Pod => Some(metrics::pod_resources(d)),
+		Projector::Node => Some(metrics::node_resources(d)),
+		_ => None,
+	};
+	Row { key: key_of(obj), namespace, cells, haystack, res }
 }
 
 fn access_modes(modes: &[Value]) -> String {

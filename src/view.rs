@@ -1,21 +1,24 @@
-//! The view: sidebar of kinds | toolbar + live table | detail pane, and a
-//! status dock. Rebuilt from `App` on every render; Tern diffs it.
+//! The view: sidebar of kinds | toolbar + live table | detail pane, a status
+//! dock, and dialogs in the layer. Rebuilt from `App` on every render; Tern
+//! diffs it.
 
 use kube::api::DynamicObject;
 use serde_json::Value;
 use tern_sdk::{
 	spans,
 	ui::{
-		self, Bound, Column, Extent, Gap, Justify, Node, PaneMin, SelectOption, Sort, SortDir, SplitDir, TableRow,
-		TextAlign, TextCell, Tone, Token, View,
+		self, Bound, Column, Extent, Gap, Justify, MeterCell, Node, OverlaySize, PaneMin, SelectOption, Sort, SortDir,
+		SplitDir, TableRow, TextAlign, TextCell, Thresholds, Tone, Token, View,
 	},
 };
 
 use crate::{
-	app::{App, Focus, Msg, Tab, Which},
+	app::{self, App, Dialog, Focus, Goto, Msg, Op, Tab, Which},
+	config::Protection,
 	format,
-	kinds::{Group, Projector},
-	rows::{self, Val},
+	kinds::{Group, Kind, Projector},
+	metrics,
+	rows::{self, Row, Val},
 };
 
 /// The view of `app` at Unix time `now`.
@@ -23,11 +26,7 @@ pub fn view(app: &mut App, now: i64) -> View<Msg> {
 	let side = sidebar(app);
 	let body = body(app, now);
 	// kube.css pins this split to the main region so each pane scrolls alone.
-	let mut split = ui::split::<Msg>()
-		.key("layout")
-		.dir(SplitDir::Row)
-		.child(side)
-		.child(body);
+	let mut split = ui::split::<Msg>().key("layout").dir(SplitDir::Row).child(side).child(body);
 	if app.detail.is_some() {
 		split = split
 			.child(detail(app, now))
@@ -36,7 +35,11 @@ pub fn view(app: &mut App, now: i64) -> View<Msg> {
 	} else {
 		split = split.sizes(vec![0.16, 0.84]).min(PaneMin::Each(vec![Some(Extent::Ch(18.0)), Some(Extent::Ch(40.0))]));
 	}
-	View::new().main(ui::col().child(split.grow(1.0))).dock(dock(app))
+	let mut v = View::new().main(ui::col().child(split.grow(1.0))).dock(dock(app));
+	if let Some(layer) = dialog(app) {
+		v = v.layer(ui::col().child(layer));
+	}
+	v
 }
 
 fn muted(t: impl Into<String>) -> ui::Span {
@@ -45,7 +48,7 @@ fn muted(t: impl Into<String>) -> ui::Span {
 
 /// A list/item key may not contain dots (they separate node ids).
 fn safe_key(id: &str) -> String {
-	id.replace('.', ":")
+	id.replace(['.', app::SEP], ":")
 }
 
 /// The node id of a sidebar group's list.
@@ -54,18 +57,21 @@ fn list_id(group: Group) -> String {
 }
 
 /// The node id of `kind`'s sidebar item (for `reveal`).
-pub fn sidebar_item_id(kind: &crate::kinds::Kind) -> String {
+pub fn sidebar_item_id(kind: &Kind) -> String {
 	format!("{}.{}", list_id(kind.group), safe_key(&kind.id))
 }
 
 fn sidebar(app: &App) -> Node<Msg> {
-	let mut col = ui::col::<Msg>().key("side").gap(Gap::Sm).child(context_select(app));
+	let mut col = ui::col::<Msg>().key("side").gap(Gap::Sm).child(context_bar(app));
+	if !app.forwards.is_empty() {
+		col = col.child(ui::text(muted("Port Forwards")).key("hpf")).child(forwards(app));
+	}
 	for group in Group::ALL {
 		let kinds: Vec<_> = app.kinds().filter(|k| k.group == group).collect();
 		let gkey = format!("g{}", group as u8);
 		if kinds.is_empty() {
 			if group == Group::Custom
-				&& let Some(err) = app.discovery.get(&app.context)
+				&& let Some(err) = app.discovery.get(app.primary())
 			{
 				col = col.child(ui::text(muted(format!("Custom resources: {err}"))).key("disc-err"));
 			}
@@ -86,18 +92,44 @@ fn sidebar(app: &App) -> Node<Msg> {
 	col.into()
 }
 
-fn context_select(app: &App) -> Node<Msg> {
+fn context_bar(app: &App) -> Node<Msg> {
 	let mut s = ui::select::<Msg>()
 		.key("ctx")
 		.label("Context")
-		.value(app.context.clone())
+		.value(app.primary().to_owned())
 		.open(app.open == Some(Which::Context))
 		.on_change(|c| Msg::Context(c.value.as_str().unwrap_or_default().to_owned()))
-		.on_toggle(|collapsed| Msg::SelectOpen(Which::Context, !collapsed));
+		.on_toggle(|collapsed| Msg::SelectOpen(Which::Context, !collapsed))
+		.grow(1.0);
 	for c in &app.contexts {
 		s = s.option(SelectOption::new(c.clone(), c.clone()));
 	}
-	s.into()
+	let more = if app.merged() { format!("+{}", app.active.len() - 1) } else { String::new() };
+	let add = ui::button(more).icon("layers").size("sm").variant("quiet").aria("Show more contexts").on_click(Msg::PickContexts);
+	ui::row::<Msg>().key("ctxbar").gap(Gap::Xs).child(s).child(add).into()
+}
+
+fn forwards(app: &App) -> Node<Msg> {
+	let mut col = ui::col::<Msg>().key("pf").gap(Gap::Xs);
+	for (id, f) in &app.forwards {
+		let id = *id;
+		let label = f.spec.label(f.local.unwrap_or(f.spec.local));
+		let status = match (&f.error, f.dead, f.local, &f.active) {
+			(Some(e), true, ..) => ui::span(format!("stopped: {e}")).style(Token::Error),
+			(Some(e), false, ..) => ui::span(e.clone()).style(Token::Warning),
+			(None, _, None, _) => muted("starting…"),
+			(None, _, Some(_), Some((pod, n))) => muted(format!("{n} open → {pod}")),
+			(None, _, Some(_), None) => ui::span("listening").style(Token::Success),
+		};
+		col = col.child(
+			ui::row::<Msg>()
+				.key(format!("f{id}"))
+				.justify(Justify::Between)
+				.child(ui::text(spans![ui::span(label).style(Token::Mono), "  ", status]))
+				.child(ui::button("").icon("x").size("sm").variant("quiet").aria("Stop").on_click(Msg::StopForward(id))),
+		);
+	}
+	col.into()
 }
 
 fn namespace_select(app: &App) -> Node<Msg> {
@@ -121,20 +153,97 @@ fn cell(v: &Val, now: i64) -> ui::Cell {
 	}
 }
 
+/// A usage cell: a meter against the limit (else the request) with the
+/// numbers in the tooltip, or the usage as text without either.
+fn usage_cell(used: f64, of: Option<f64>, req: Option<f64>, fmt: fn(f64) -> String) -> ui::Cell {
+	let mut title = format!("{} used", fmt(used));
+	if let Some(r) = req {
+		title.push_str(&format!(" · {} requested", fmt(r)));
+	}
+	match of.or(req).filter(|d| *d > 0.0) {
+		Some(d) => {
+			if let Some(l) = of {
+				title.push_str(&format!(" · {} limit", fmt(l)));
+			}
+			MeterCell {
+				value: Some((used / d).min(1.0)),
+				thresholds: Some(Thresholds { warn: Some(0.8), bad: Some(0.95) }),
+				title: Some(title),
+				..MeterCell::default()
+			}
+			.into()
+		},
+		None => TextCell::new(fmt(used)).title(title).into(),
+	}
+}
+
+fn metric_cell(app: &App, ctx: &str, row: &Row, col: &str) -> ui::Cell {
+	let Some(u) = app.usage(ctx, row) else { return "".into() };
+	let res = row.res.unwrap_or_default();
+	if col == "cpu" {
+		usage_cell(u.cpu, res.cpu_lim, res.cpu_req, metrics::fmt_cpu)
+	} else {
+		usage_cell(u.mem, res.mem_lim, res.mem_req, metrics::fmt_mem)
+	}
+}
+
+fn table_row(app: &App, ctx: &str, r: &Row, cols: &[crate::kinds::ColSpec], acts: &[(&str, &str)], now: i64) -> TableRow {
+	let mut row = TableRow::new(app::row_id(ctx, &r.key));
+	for c in cols {
+		let v = match c.id {
+			"context" => ctx.into(),
+			"cpu" | "memory" => metric_cell(app, ctx, r, c.id),
+			id => cell(r.get(id), now),
+		};
+		row = row.cell(c.id, v);
+	}
+	for (act, _) in acts {
+		row = row.menu(*act);
+	}
+	row
+}
+
 fn body(app: &mut App, now: i64) -> Node<Msg> {
 	let kind = app.kind().clone();
-	let namespaced = kind.namespaced;
-	let total = app.store().map_or(0, |s| s.rows.len());
+	let total = app.total();
 	let shown = app.visible().len();
-	let (status, tone) = match app.store() {
-		Some(s) if s.error.is_some() => (if s.denied { "forbidden" } else { "error" }, Tone::Error),
-		Some(s) if s.synced => ("live", Tone::Success),
-		_ => ("loading", Tone::Pending),
+	let errors: Vec<String> = app.stores().filter_map(|(c, s)| s.error.as_ref().map(|e| format!("{c}: {e}"))).collect();
+	let denied = app.stores().any(|(_, s)| s.denied);
+	let synced = app.stores().count() == app.active.len() && app.stores().all(|(_, s)| s.synced);
+	let (status, tone) = match () {
+		() if !errors.is_empty() => (if denied { "forbidden" } else { "error" }, Tone::Error),
+		() if synced => ("live", Tone::Success),
+		() => ("loading", Tone::Pending),
 	};
 	let count = if shown == total { format!("{total}") } else { format!("{shown} / {total}") };
-	let mut bar = ui::row::<Msg>().key("bar").gap(Gap::Sm);
-	if namespaced {
+	let (back, fwd) = app.can_go();
+	let mut bar = ui::row::<Msg>()
+		.key("bar")
+		.gap(Gap::Sm)
+		.child(
+			ui::button("")
+				.icon("arrow-left")
+				.size("sm")
+				.variant("quiet")
+				.aria("Back")
+				.disabled(!back)
+				.on_click(Msg::Back),
+		)
+		.child(
+			ui::button("")
+				.icon("arrow-right")
+				.size("sm")
+				.variant("quiet")
+				.aria("Forward")
+				.disabled(!fwd)
+				.on_click(Msg::Forward),
+		);
+	if kind.namespaced {
 		bar = bar.child(namespace_select(app));
+	}
+	let mut badge = ui::badge(status).tone(tone).key("live");
+	if !errors.is_empty() {
+		badge = badge.title(errors.join("\n"));
 	}
 	bar = bar
 		.child(
@@ -151,10 +260,10 @@ fn body(app: &mut App, now: i64) -> Node<Msg> {
 				.on_edit(|e| Msg::EditFilter { from: e.from, to: e.to, text: e.text.clone(), cursor: e.cursor })
 				.grow(1.0),
 		)
-		.child(ui::badge(status).tone(tone).key("live"))
+		.child(badge)
 		.child(ui::text(muted(count)).key("count"));
 
-	let cols = kind.columns();
+	let cols = app.columns();
 	let mut table = ui::table::<Msg>()
 		.key("table")
 		.selectable(true)
@@ -171,6 +280,9 @@ fn body(app: &mut App, now: i64) -> Node<Msg> {
 			};
 			Msg::Sort(col, dir)
 		});
+	for act in ROW_ACTS {
+		table = table.on_action_with(*act, move |a| Msg::Act((*act).to_owned(), a.item.clone()));
+	}
 	for c in &cols {
 		let mut column = Column::new(c.id, c.head).priority(c.priority).sortable(true);
 		if c.grow {
@@ -185,29 +297,36 @@ fn body(app: &mut App, now: i64) -> Node<Msg> {
 		table = table.selected(sel.clone());
 	}
 	let visible = app.visible().to_vec();
-	let rows: Vec<TableRow> = app.store().map_or_else(Vec::new, |store| {
-		visible
-			.iter()
-			.filter_map(|k| store.rows.get(k))
-			.map(|r| {
-				let mut row = TableRow::new(r.key.clone());
-				for c in &cols {
-					row = row.cell(c.id, cell(r.get(c.id), now));
-				}
-				row
-			})
-			.collect()
-	});
+	let rows: Vec<TableRow> = visible
+		.iter()
+		.filter_map(|id| {
+			let (row, obj) = app.lookup(id)?;
+			let (ctx, _) = app::split_id(id);
+			let acts = app.acts(&kind, obj);
+			Some(table_row(app, ctx, row, &cols, &acts, now))
+		})
+		.collect();
 	ui::col::<Msg>().key("body").gap(Gap::Sm).child(bar).child(table.rows(rows).grow(1.0)).into()
 }
 
+/// Every row action id (each needs its handler on the table).
+const ROW_ACTS: &[&str] = &[
+	"shell", "logs", "forward", "scale", "restart", "trigger", "suspend", "resume", "cordon", "uncordon", "edit", "delete",
+];
+
 fn empty_text(app: &App) -> String {
-	match app.store() {
-		Some(s) if s.error.is_some() => s.error.clone().unwrap_or_default(),
-		Some(s) if !s.synced => "Loading…".into(),
-		Some(s) if !s.rows.is_empty() => "Nothing matches the filter".into(),
-		_ => format!("No {} here", app.kind().label.to_lowercase()),
+	let stores: Vec<_> = app.stores().collect();
+	if let Some((c, s)) = stores.iter().find(|(_, s)| s.error.is_some()) {
+		let e = s.error.clone().unwrap_or_default();
+		return if app.merged() { format!("{c}: {e}") } else { e };
 	}
+	if stores.len() < app.active.len() || stores.iter().any(|(_, s)| !s.synced) {
+		return "Loading…".into();
+	}
+	if stores.iter().any(|(_, s)| !s.rows.is_empty()) {
+		return "Nothing matches the filter".into();
+	}
+	format!("No {} here", app.kind().label.to_lowercase())
 }
 
 fn s<'a>(v: &'a Value, path: &[&str]) -> &'a str {
@@ -228,27 +347,30 @@ fn scalar(v: Option<&Value>) -> String {
 
 fn detail(app: &mut App, now: i64) -> Node<Msg> {
 	let kind = app.kind().clone();
-	let Some(obj) = app.detail_obj().cloned() else {
+	let Some((ctx, obj)) = app.detail_obj().map(|(c, o)| (c.to_owned(), o.clone())) else {
 		return ui::col::<Msg>()
 			.key("detail")
-			.child(ui::empty("Deleted").text("The object no longer exists."))
+			.child(ui::empty("Gone").text("The object no longer exists."))
 			.child(ui::button("Close").on_click(Msg::CloseDetail))
 			.into();
 	};
 	let tab = app.detail.as_ref().map_or(Tab::Overview, |d| d.tab);
 	let name = obj.metadata.name.clone().unwrap_or_default();
-	let mut actions = ui::row::<Msg>().key("acts").gap(Gap::Xs);
-	if kind.is_pod() {
-		actions = actions.child(ui::button("Shell").icon("terminal").size("sm").keys(["s"]).on_click(Msg::Shell));
+	let mut actions = ui::row::<Msg>().key("acts").gap(Gap::Xs).wrap(true);
+	for (act, label) in app.acts(&kind, &obj) {
+		if act == "logs" {
+			continue;
+		}
+		let variant = if act == "delete" { "danger" } else { "quiet" };
+		let label = label.trim_end_matches('…');
+		actions = actions.child(ui::button(label).size("sm").variant(variant).key(act).on_click(Msg::Act(act.to_owned(), None)));
 	}
-	actions = actions
-		.child(ui::button("Edit").icon("pencil").size("sm").variant("quiet").keys(["e"]).on_click(Msg::Edit))
-		.child(ui::button("").icon("x").size("sm").variant("quiet").aria("Close").on_click(Msg::CloseDetail));
-	let head = ui::row::<Msg>()
-		.key("head")
-		.justify(Justify::Between)
-		.child(ui::text(spans![ui::span(name).style(Token::Strong), muted(format!("  {}", obj_kind(&obj, &kind.ar.kind)))]))
-		.child(actions);
+	actions = actions.child(ui::button("").icon("x").size("sm").variant("quiet").aria("Close").key("close").on_click(Msg::CloseDetail));
+	let mut title = spans![ui::span(name).style(Token::Strong), muted(format!("  {}", obj_kind(&obj, &kind.ar.kind)))];
+	if app.merged() {
+		title.push(muted(format!("  · {ctx}")));
+	}
+	let head = ui::col::<Msg>().key("head").gap(Gap::Xs).child(ui::text(title)).child(actions);
 	let warnings = app
 		.detail
 		.as_ref()
@@ -263,12 +385,12 @@ fn detail(app: &mut App, now: i64) -> Node<Msg> {
 		.tab("overview", "Overview")
 		.tab("yaml", "YAML")
 		.tab("events", events_label);
-	if kind.is_pod() {
+	if kind.has_logs() {
 		tabs = tabs.tab("logs", "Logs");
 	}
 	let tabs = tabs.on_select(|id| Msg::Tab(Tab::from_id(id).unwrap_or(Tab::Overview)));
 	let content: Node<Msg> = match tab {
-		Tab::Overview => overview(&obj, kind.projector, now),
+		Tab::Overview => overview(app, &ctx, &obj, kind.projector, now),
 		Tab::Yaml => yaml(app, &obj, &kind.ar),
 		Tab::Events => events(app, now),
 		Tab::Logs => logs(app),
@@ -280,7 +402,7 @@ fn obj_kind(obj: &DynamicObject, fallback: &str) -> String {
 	obj.types.as_ref().map_or_else(|| fallback.to_owned(), |t| t.kind.clone())
 }
 
-fn overview(obj: &DynamicObject, projector: Projector, now: i64) -> Node<Msg> {
+fn overview(app: &App, ctx: &str, obj: &DynamicObject, projector: Projector, now: i64) -> Node<Msg> {
 	let m = &obj.metadata;
 	let d = &obj.data;
 	let mut kv = ui::kv::<Msg>().key("meta").item("Name", m.name.clone().unwrap_or_default());
@@ -291,14 +413,29 @@ fn overview(obj: &DynamicObject, projector: Projector, now: i64) -> Node<Msg> {
 		let secs = t.0.as_second();
 		kv = kv.item("Created", format!("{} ago ({})", format::age(now - secs), t.0));
 	}
-	if let Some(owners) = &m.owner_references
-		&& !owners.is_empty()
-	{
-		let text = owners.iter().map(|o| format!("{}/{}", o.kind, o.name)).collect::<Vec<_>>().join(", ");
-		kv = kv.item("Controlled by", text);
-	}
 	kv = kv.item("UID", ui::span(m.uid.clone().unwrap_or_default()).style(Token::Mono));
 	let mut col = ui::col::<Msg>().key("overview").gap(Gap::Md).child(kv);
+
+	// Owners link to their detail.
+	let owners: Vec<_> = m.owner_references.iter().flatten().collect();
+	if !owners.is_empty() {
+		let mut row = ui::row::<Msg>().key("owners").gap(Gap::Xs).wrap(true).child(ui::text(muted("Controlled by")));
+		for (i, o) in owners.iter().enumerate() {
+			let label = format!("{}/{}", o.kind, o.name);
+			let button = ui::button(label).size("sm").variant("quiet").icon("arrow-up-right").key(format!("o{i}"));
+			row = row.child(match app.kind_of_owner(&o.api_version, &o.kind) {
+				Some(kind) => {
+					let key = match &m.namespace {
+						Some(ns) => format!("{ns}/{}", o.name),
+						None => o.name.clone(),
+					};
+					button.on_click(Msg::Goto(Goto { context: ctx.to_owned(), kind, key }))
+				},
+				None => button.disabled("Not listed here"),
+			});
+		}
+		col = col.child(row);
+	}
 
 	let mut spec: Vec<(String, String)> = Vec::new();
 	let mut push = |k: &str, v: String| {
@@ -355,9 +492,13 @@ fn overview(obj: &DynamicObject, projector: Projector, now: i64) -> Node<Msg> {
 		Projector::CronJob => {
 			push("Schedule", s(d, &["spec", "schedule"]).into());
 			push("Concurrency", s(d, &["spec", "concurrencyPolicy"]).into());
+			push("Suspended", scalar(rows::at(d, &["spec", "suspend"])));
 			push("Last schedule", s(d, &["status", "lastScheduleTime"]).into());
 		},
 		_ => {},
+	}
+	if let Some(usage) = usage_line(app, ctx, obj, projector) {
+		push("Usage", usage);
 	}
 	if !spec.is_empty() {
 		let kv = spec.into_iter().fold(ui::kv::<Msg>().key("spec"), |kv, (k, v)| kv.item(k, v));
@@ -365,6 +506,9 @@ fn overview(obj: &DynamicObject, projector: Projector, now: i64) -> Node<Msg> {
 	}
 	if projector == Projector::Pod {
 		col = col.child(containers(d));
+	}
+	if let Some(pods) = child_pods(app, now) {
+		col = col.child(pods);
 	}
 	let conditions = arr(d, &["status", "conditions"]);
 	if !conditions.is_empty() {
@@ -416,6 +560,48 @@ fn overview(obj: &DynamicObject, projector: Projector, now: i64) -> Node<Msg> {
 		);
 	}
 	col.into()
+}
+
+/// `120m CPU · 256Mi memory` of a pod or node, when metrics are in.
+fn usage_line(app: &App, ctx: &str, obj: &DynamicObject, projector: Projector) -> Option<String> {
+	let snap = app.metrics.get(ctx)?.as_ref().ok()?;
+	let u = match projector {
+		Projector::Pod => snap.pods.get(&rows::key_of(obj))?,
+		Projector::Node => snap.nodes.get(obj.metadata.name.as_deref()?)?,
+		_ => return None,
+	};
+	Some(format!("{} CPU · {} memory", metrics::fmt_cpu(u.cpu), metrics::fmt_mem(u.mem)))
+}
+
+/// The pods a workload, service or node has, each linking to its detail.
+fn child_pods(app: &App, now: i64) -> Option<Node<Msg>> {
+	let kind = app.kind();
+	if !kind.selects_pods() && kind.projector != Projector::Node {
+		return None;
+	}
+	let pods = app.child_pods();
+	let mut t = ui::table::<Msg>()
+		.key("pods")
+		.selectable(true)
+		.empty("No pods")
+		.col(Column::new("name", "Pod").grow(1.0).priority(100.0))
+		.col(Column::new("ready", "Ready").align(TextAlign::End).mono(true).priority(80.0))
+		.col(Column::new("status", "Status").priority(90.0))
+		.col(Column::new("restarts", "Restarts").align(TextAlign::End).mono(true).priority(50.0))
+		.col(Column::new("age", "Age").align(TextAlign::End).mono(true).priority(60.0))
+		.on_activate(|id| {
+			let (context, key) = app::split_id(id);
+			Msg::Goto(Goto { context: context.to_owned(), kind: "pods".into(), key: key.to_owned() })
+		});
+	let n = pods.len();
+	for (id, r) in pods {
+		let mut row = TableRow::new(id);
+		for c in ["name", "ready", "status", "restarts", "age"] {
+			row = row.cell(c, cell(r.get(c), now));
+		}
+		t = t.row(row);
+	}
+	Some(ui::section().key("kids").head(format!("Pods ({n})")).child(t).into())
 }
 
 fn selector(v: Option<&Value>) -> String {
@@ -501,7 +687,7 @@ fn logs(app: &App) -> Node<Msg> {
 	let Some(d) = &app.detail else { return ui::text("").into() };
 	let l = &d.logs;
 	let containers = app.containers();
-	let mut bar = ui::row::<Msg>().key("logbar").gap(Gap::Sm);
+	let mut bar = ui::row::<Msg>().key("logbar").gap(Gap::Sm).wrap(true);
 	if containers.len() > 1 {
 		let mut sel = ui::select::<Msg>()
 			.key("container")
@@ -515,15 +701,23 @@ fn logs(app: &App) -> Node<Msg> {
 		}
 		bar = bar.child(sel);
 	}
+	let pods = if l.pods > 1 { format!(" from {} pods", l.pods) } else { String::new() };
 	let state = match (&l.error, l.live) {
 		(Some(e), _) => ui::span(e.clone()).style(Token::Error),
-		(None, true) => ui::span(format!("{} lines · following", l.lines)).style(Token::Muted),
-		(None, false) => ui::span(format!("{} lines · ended", l.lines)).style(Token::Muted),
+		(None, true) => ui::span(format!("{} lines{pods} · following", l.lines)).style(Token::Muted),
+		(None, false) => ui::span(format!("{} lines{pods} · ended", l.lines)).style(Token::Muted),
 	};
-	bar = bar
-		.child(ui::button("Previous").size("sm").variant("quiet").on(l.previous).on_click(Msg::Previous))
-		.child(ui::button("Follow in terminal").icon("terminal").size("sm").variant("quiet").on_click(Msg::FollowInTerminal))
-		.child(ui::text(state).key("state"));
+	bar = bar.child(ui::button("Previous").size("sm").variant("quiet").on(l.previous).on_click(Msg::Previous));
+	if app.kind().is_pod() {
+		bar = bar.child(
+			ui::button("Follow in terminal")
+				.icon("terminal")
+				.size("sm")
+				.variant("quiet")
+				.on_click(Msg::Act("follow".into(), None)),
+		);
+	}
+	bar = bar.child(ui::text(state).key("state"));
 	ui::col::<Msg>()
 		.key("logs")
 		.gap(Gap::Sm)
@@ -532,20 +726,174 @@ fn logs(app: &App) -> Node<Msg> {
 		.into()
 }
 
-fn dock(app: &App) -> Node<Msg> {
-	let pod = app.kind().is_pod();
-	let hint = match (app.focus, app.detail.is_some(), pod) {
-		(Focus::Filter, ..) => "type to filter · ↵ done · esc clear",
-		(_, true, true) => "↑↓ select · tab next tab · l logs · s shell · e edit · esc close",
-		(_, true, false) => "↑↓ select · tab next tab · e edit · esc close",
-		(_, false, true) => "↑↓ select · ↵ open · / filter · l logs · s shell · [ ] kind · q quit",
-		(_, false, false) => "↑↓ select · ↵ open · / filter · [ ] kind · q quit",
+fn dialog(app: &App) -> Option<Node<Msg>> {
+	let d = app.dialog.as_ref()?;
+	let cancel = ui::button("Cancel").variant("quiet").keys(["esc"]).key("cancel").on_click(Msg::Cancel);
+	let node: Node<Msg> = match d {
+		Dialog::Confirm { target, op, unlock } => {
+			let verb = match op {
+				Op::Change(m) => m.verb(),
+				Op::Terminal(crate::actions::Action::Shell) => "Open a shell in".into(),
+				Op::Terminal(crate::actions::Action::Edit) => "Edit".into(),
+				Op::Terminal(crate::actions::Action::FollowLogs) => "Follow the log of".into(),
+			};
+			let danger = matches!(op, Op::Change(m) if m.destructive());
+			let go_label = if *unlock { format!("Unlock for 15 min and {}", verb.to_lowercase()) } else { verb.clone() };
+			let go = ui::button(go_label)
+				.variant(if danger { "danger" } else { "primary" })
+				.keys(["enter"])
+				.key("go")
+				.on_click(Msg::Confirm);
+			let mut body = ui::col::<Msg>().key("body").gap(Gap::Sm).child(ui::text(spans![
+				format!("{verb} "),
+				ui::span(target.label()).style(Token::Strong),
+				" in context ",
+				ui::span(target.context.clone()).style(Token::Strong),
+				target.obj.metadata.namespace.as_ref().map_or_else(String::new, |ns| format!(", namespace {ns}")),
+				"?"
+			]));
+			if *unlock {
+				body = body.child(ui::text(ui::span("This context is protected.").style(Token::Warning)).key("warn"));
+			}
+			ui::overlay::<Msg>()
+				.key("confirm")
+				.modal(true)
+				.size(OverlaySize::Sm)
+				.head(format!("{verb} {}", target.label()))
+				.icon(if danger { "trash" } else { "alert-triangle" })
+				.foot("confirm.foot")
+				.child(body)
+				.child(ui::row::<Msg>().key("foot").justify(Justify::End).gap(Gap::Sm).child(cancel).child(go))
+				.into()
+		},
+		Dialog::Scale { target, replicas } => ui::overlay::<Msg>()
+			.key("scale")
+			.modal(true)
+			.size(OverlaySize::Sm)
+			.head(format!("Scale {}", target.label()))
+			.icon("layers")
+			.foot("scale.foot")
+			.child(
+				ui::col::<Msg>().key("body").gap(Gap::Sm).child(ui::text(muted(format!("Context {}", target.context)))).child(
+					ui::input::<Msg>()
+						.key("replicas")
+						.text(replicas.clone())
+						.cursor(replicas.len())
+						.unit("replicas")
+						.stepper(true)
+						.mono(true)
+						.on_action("inc", Msg::Step(1))
+						.on_action("dec", Msg::Step(-1)),
+				),
+			)
+			.child(
+				ui::row::<Msg>().key("foot").justify(Justify::End).gap(Gap::Sm).child(cancel).child(
+					ui::button("Scale").variant("primary").keys(["enter"]).key("go").on_click(Msg::Confirm),
+				),
+			)
+			.into(),
+		Dialog::Forward { target, ports, port, local } => {
+			let mut list = ui::list::<Msg>().key("ports").selected(format!("layer.forward.body.ports.p{port}"));
+			for (p, label) in ports {
+				let p = *p;
+				list = list.child(ui::item(label.clone()).key(format!("p{p}")).on_select(move |_| Msg::ForwardPort(p)));
+			}
+			ui::overlay::<Msg>()
+				.key("forward")
+				.modal(true)
+				.size(OverlaySize::Sm)
+				.head(format!("Port forward {}", target.label()))
+				.icon("plug")
+				.foot("forward.foot")
+				.child(
+					ui::col::<Msg>()
+						.key("body")
+						.gap(Gap::Sm)
+						.child(ui::text(muted("Remote port")).key("h1"))
+						.child(list)
+						.child(ui::text(muted("Local port (0 picks a free one)")).key("h2"))
+						.child(ui::input::<Msg>().key("local").text(local.clone()).cursor(local.len()).prefix("localhost:").mono(true)),
+				)
+				.child(
+					ui::row::<Msg>().key("foot").justify(Justify::End).gap(Gap::Sm).child(cancel).child(
+						ui::button("Forward").variant("primary").keys(["enter"]).key("go").on_click(Msg::Confirm),
+					),
+				)
+				.into()
+		},
+		Dialog::Contexts => {
+			let mut list = ui::list::<Msg>().key("ctxs");
+			for c in &app.contexts {
+				let on = app.active.contains(c);
+				let ctx = c.clone();
+				let detail = match app.protection(c) {
+					Protection::None => "",
+					Protection::Protected => "protected",
+					Protection::ReadOnly => "read-only",
+				};
+				list = list.child(
+					ui::item(c.clone())
+						.key(safe_key(c))
+						.icon(if on { "check-square" } else { "square" })
+						.detail(detail)
+						.on_select(move |_| Msg::ToggleContext(ctx.clone())),
+				);
+			}
+			ui::overlay::<Msg>()
+				.key("contexts")
+				.modal(true)
+				.size(OverlaySize::Md)
+				.head("Contexts")
+				.meta(format!("{} shown", app.active.len()))
+				.icon("layers")
+				.foot("contexts.foot")
+				.child(ui::col::<Msg>().key("body").gap(Gap::Sm).child(ui::text(muted("Every checked context is merged into one table."))).child(list))
+				.child(
+					ui::row::<Msg>()
+						.key("foot")
+						.justify(Justify::End)
+						.child(ui::button("Done").variant("primary").keys(["esc"]).key("done").on_click(Msg::Cancel)),
+				)
+				.into()
+		},
 	};
-	let mut status = ui::status::<Msg>().child(ui::seg(app.context.clone()).icon("cloud"));
+	Some(node)
+}
+
+fn dock(app: &App) -> Node<Msg> {
+	let kind = app.kind();
+	let hint = if app.dialog.is_some() {
+		"↵ confirm · esc cancel".to_owned()
+	} else if app.g_pending {
+		app::JUMPS.iter().map(|(k, id)| format!("{k} {}", id.split('.').next().unwrap_or(id))).collect::<Vec<_>>().join(" · ")
+	} else if app.focus == Focus::Filter {
+		"type to filter · ↵ done · esc clear".to_owned()
+	} else {
+		let mut h = vec!["↑↓ select", "↵ open", "/ filter", "g jump", "⌥←→ history"];
+		if kind.has_logs() {
+			h.push("l logs");
+		}
+		if kind.is_pod() {
+			h.extend(["s shell", "f forward"]);
+		}
+		if kind.scalable() {
+			h.push("S scale");
+		}
+		if kind.restartable() {
+			h.push("R restart");
+		}
+		h.extend(["e edit", "⌦ delete", "C contexts"]);
+		h.join(" · ")
+	};
+	let ctx_label = if app.merged() { format!("{} contexts", app.active.len()) } else { app.primary().to_owned() };
+	let mut status = ui::status::<Msg>().child(ui::seg(ctx_label).icon("cloud"));
+	if let Some(p) = app.pending.values().next_back() {
+		status = status.child(ui::seg(format!("{p}…")).icon("loader"));
+	}
 	if let Some(n) = &app.notice {
-		status = status.child(ui::seg(n.clone()).icon("alert-triangle"));
-	} else if let Some(err) = app.store().and_then(|s| s.error.clone()) {
-		status = status.child(ui::seg(err).icon("alert-triangle"));
+		status = status.child(ui::seg(n.text.clone()).icon(if n.error { "alert-triangle" } else { "check" }));
+	} else if let Some((c, e)) = app.stores().find_map(|(c, s)| s.error.as_ref().map(|e| (c, e))) {
+		status = status.child(ui::seg(format!("{c}: {e}")).icon("alert-triangle"));
 	}
 	status.child(ui::seg(hint)).into()
 }
