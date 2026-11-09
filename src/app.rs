@@ -1443,8 +1443,10 @@ impl App {
 		};
 		let shift = key.shift;
 		match key.name.as_str() {
-			"left" if key.alt => self.update(Msg::Back),
-			"right" if key.alt => self.update(Msg::Forward),
+			// Option+←/→ arrives as the arrow with Alt, or as Esc-b / Esc-f
+			// (Alt+b / Alt+f) from terminals that send word motions.
+			"left" | "b" if key.alt => self.update(Msg::Back),
+			"right" | "f" if key.alt => self.update(Msg::Forward),
 			"down" | "j" if !key.ctrl => self.move_selection(1),
 			"up" | "k" if !key.ctrl => self.move_selection(-1),
 			"page_down" => self.move_selection(20),

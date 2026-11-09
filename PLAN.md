@@ -59,14 +59,18 @@ flowchart LR
 ```
 src/
   main.rs        startup, runtime, session loop, render batching
-  app.rs         state, update(Msg), key handling, selection
-  backend.rs     Cmd/Update, client cache, watcher LRU, logs, events
-  kinds.rs       kind registry: sidebar groups, ApiResource, columns, projector
+  app.rs         state, update(Msg), keys, merged contexts, dialogs, history
+  backend.rs     Cmd/Update, per-context client cells, watches, logs, events, metrics polls
+  kinds.rs       kind registry: sidebar groups, ApiResource, columns, capabilities
   rows.rs        Row model and per-kind projection (DynamicObject → cells)
+  metrics.rs     Metrics API snapshots, quantities, requests/limits
+  mutate.rs      scale, restart, delete, CronJob trigger/suspend, cordon
+  portforward.rs local listeners → pod / service (re-resolved per connection)
+  config.rs      change protection (protected / read-only contexts)
   filter.rs      filter grammar: AND words, `a|b` OR, `!x` NOT, `*` glob, `/re/`
-  format.rs      ages, quantities, status tones
-  view.rs        sidebar, toolbar, table, detail tabs, logs, dock
-  actions.rs     tern split launches (shell, edit, logs -f, port-forward)
+  format.rs      ages, natural sort
+  view.rs        sidebar, toolbar, table, detail tabs, logs, dialogs, dock
+  actions.rs     tern split launches (shell, edit, logs -f)
 plugin/
   plugin.toml    window-only plugin: id tern-kube
   window.luau    "Open Kubernetes" command + keybind → new tab running tern-kube
@@ -74,17 +78,15 @@ plugin/
 
 ## 4. Milestones
 
-1. **Browse (done):**
-   - kubeconfig contexts, context and namespace selects
-   - grouped sidebar of built-in kinds plus discovered CRDs
-   - live table: watch, sort, filter, keyboard navigation, connection state
-   - detail pane: Overview, YAML, Events, Logs
-   - Shell, Edit and `logs -f` in terminal splits
-   - launcher plugin
-2. **Actions:** scale, rollout restart, delete, CronJob trigger and suspend, cordon/uncordon. Confirm overlay naming the context. Read-only contexts.
-3. **Metrics:** `metrics.k8s.io` polled every 15 s; CPU and memory meter cells against requests and limits.
-4. **Several contexts at once:** merged tables with a Context column. Row ids are context-qualified from milestone 1.
-5. **Navigation:** back/forward, `g p`/`g d` jumps, owner → child links, aggregated workload logs, port-forward manager.
+All five are implemented.
+
+1. **Browse:** contexts, namespaces, grouped kinds plus CRDs, live sortable/filterable tables, detail pane (Overview, YAML, Events, Logs), Shell/Edit/`logs -f` splits, launcher plugin.
+2. **Actions:** scale, rollout restart, delete, CronJob trigger and suspend, cordon/uncordon. The confirmation names the context. Protected contexts need an unlock; read-only contexts refuse.
+3. **Metrics:** `metrics.k8s.io` polled every 15 s; CPU and memory meter cells against limits or requests.
+4. **Several contexts at once:** merged tables with a Context column and a context picker.
+5. **Navigation:** back/forward, `g` jumps, owner links, child pods, aggregated workload logs, port-forward manager.
+
+Open: aggregated CPU/memory for workloads, bulk actions on multi-selected rows, a native YAML editor with diff, Helm and GitOps views.
 
 ## 5. Verification
 
