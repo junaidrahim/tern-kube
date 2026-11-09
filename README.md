@@ -24,9 +24,11 @@ A small Tern plugin opens it from the command palette.
 | | |
 | --- | --- |
 | ![Health](docs/screenshots/health.png) **Health:** problem pods, unready workloads, nodes, pending claims, failed jobs and the last hour's warnings, per context. | ![Deployment](docs/screenshots/deployment.png) **Detail:** a workload with its pods and summed usage, conditions and labels. |
-| ![Logs](docs/screenshots/logs.png) **Logs:** streamed, filtered with the table's filter grammar, with timestamps, pause and copy. | ![Merged logs](docs/screenshots/bulklogs.png) **Merged logs** of picked pods, across contexts, each line tagged with its pod. |
-| ![Contexts](docs/screenshots/bar.png) **Several clusters** in one table with aliases and colors; pick rows for bulk actions. | ![Editor](docs/screenshots/review.png) **YAML editor:** edit in place, review the diff, apply. |
+| ![Logs](docs/screenshots/logs.png) **Logs:** streamed, filtered with the table's filter grammar, with timestamps, pause and copy. | ![Merged logs](docs/screenshots/merged-logs.png) **Merged logs** of picked pods, across contexts, each line tagged with its pod. |
+| ![Contexts](docs/screenshots/contexts.png) **Several clusters** in one table with aliases and colors; pick rows for bulk actions. | ![Editor](docs/screenshots/editor.png) **YAML editor:** edit in place, review the diff, apply. |
 | ![Palette](docs/screenshots/palette.png) **Go to** (⌃K): kinds, actions and every loaded object. | ![Helm](docs/screenshots/helm.png) **Helm releases:** history, values, notes, rollback and uninstall. |
+| ![Compare](docs/screenshots/compare.png) **Compare** an object with the same one in another context or namespace. | ![Secret](docs/screenshots/secret.png) **Secrets:** values hidden until revealed, copy per key. |
+| ![TLS](docs/screenshots/tls.png) **TLS secrets** decode the certificate: subject, issuer, names and expiry. | |
 
 ## Functions
 
