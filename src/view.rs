@@ -340,7 +340,6 @@ fn body(app: &mut App, now: i64) -> Node<Msg> {
 		.multi(true)
 		.variant("bar")
 		.picked(app.picked.clone())
-		.hint(muted("selected"))
 		.sort(Sort { col: app.sort.0.clone(), dir: app.sort.1.clone() })
 		.empty(empty_text(app))
 		.on_select(|id| Msg::Select(id.to_owned()))

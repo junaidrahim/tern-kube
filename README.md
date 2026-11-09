@@ -5,6 +5,8 @@ modeled on [Aptakube](https://aptakube.com).
 It is a Rust program that draws Tern's native UI through the Tern Surface Protocol.
 A small Tern plugin opens it from the command palette.
 
+![Pods with live CPU and memory](docs/screenshots/pods.png)
+
 ## How it works
 
 - It reads your kubeconfig with `kube-rs` and talks to the API servers directly.
@@ -17,54 +19,83 @@ A small Tern plugin opens it from the command palette.
   A slow sign-in in one cluster does not hold up another.
 - It never changes your kubeconfig, and it runs no agent in the cluster.
 
+## Screens
+
+| | |
+| --- | --- |
+| ![Health](docs/screenshots/health.png) **Health:** problem pods, unready workloads, nodes, pending claims, failed jobs and the last hour's warnings, per context. | ![Deployment](docs/screenshots/deployment.png) **Detail:** a workload with its pods and summed usage, conditions and labels. |
+| ![Logs](docs/screenshots/logs.png) **Logs:** streamed, filtered with the table's filter grammar, with timestamps, pause and copy. | ![Merged logs](docs/screenshots/bulklogs.png) **Merged logs** of picked pods, across contexts, each line tagged with its pod. |
+| ![Contexts](docs/screenshots/bar.png) **Several clusters** in one table with aliases and colors; pick rows for bulk actions. | ![Editor](docs/screenshots/review.png) **YAML editor:** edit in place, review the diff, apply. |
+| ![Palette](docs/screenshots/palette.png) **Go to** (⌃K): kinds, actions and every loaded object. | ![Helm](docs/screenshots/helm.png) **Helm releases:** history, values, notes, rollback and uninstall. |
+
 ## Functions
 
 - **Clusters**
-  - Pick one context, or merge several into one table with a Context column (**C**, or the layers button).
+  - One context, or several merged into one table with a Context column.
+  - Context aliases, colors and tags; a tag shows all its contexts at once.
   - Namespace filter.
+  - Change protection: protected contexts need a 15-minute unlock before changes, read-only contexts refuse them.
 - **Resources**
-  - Workloads: Pods, Deployments, StatefulSets, DaemonSets, ReplicaSets, Jobs, CronJobs, HPAs.
+  - Workloads: Pods, Deployments, StatefulSets, DaemonSets, ReplicaSets, Jobs, CronJobs, HPAs, Pod Disruption Budgets.
+  - Helm releases (read from their secrets), Argo CD applications and Flux objects.
   - Network: Services, Ingresses, Endpoint Slices, Network Policies.
   - Config: ConfigMaps, Secrets.
   - Storage: PVCs, PVs, Storage Classes.
   - Cluster: Nodes, Namespaces, Events.
   - Access control: Service Accounts, Roles, Role Bindings, Cluster Roles, Cluster Role Bindings.
-  - Every custom resource that discovery finds.
+  - Every custom resource that discovery finds, with its CRD's printer columns.
 - **Tables**
   - Live tables with sortable columns and kubectl-style status (for example `CrashLoopBackOff` or `Init:0/1`).
-  - CPU and memory for pods and nodes from the Metrics API (metrics-server).
+  - CPU and memory for pods, nodes and workloads (summed over their pods) from the Metrics API.
     Bars measure usage against the limit, else the request.
-- **Filter**
-  - Words must all match.
-  - `a|b` matches either.
-  - `!x` excludes.
-  - `*` is a wildcard.
-  - `/regex/` is a regular expression.
+  - Label columns of your choice for each kind.
+  - **Filter:**
+    - Words must all match.
+    - `a|b` matches either.
+    - `!x` excludes.
+    - `*` is a wildcard.
+    - `/regex/` is a regular expression.
 - **Detail pane**
-  - **Overview:** metadata, owner links, kind details, containers, child pods of workloads, services and nodes, conditions, labels and annotations.
-  - **YAML.**
+  - **Overview:**
+    - Metadata, owner links, kind details, containers, conditions, labels, annotations.
+    - Child pods of workloads, services and nodes.
+    - Secret values: hidden until revealed, copyable, with TLS certificate details.
+    - ConfigMap values, highlighted per key.
+  - **YAML:**
+    - Copy.
+    - Edit in place, review the diff, apply.
+      The apply carries the version it started from, so a change made on the server meanwhile is refused instead of overwritten.
   - **Events:** live.
-  - **Logs:**
-    - Streamed, with a container picker and the previous instance's log.
-    - Workloads and services merge the logs of all their pods, each line tagged with its pod.
-- **Actions** (row right-click menu, detail buttons or keys)
+  - **Logs:** streamed; container picker, previous instance, timestamps, filter, pause and copy.
+    Workloads and services merge the logs of their pods.
+  - **Compare:** a diff against the same object in another context or namespace.
+- **Actions** (right-click a row, detail buttons, or keys)
   - Scale, rollout restart and delete.
   - CronJob trigger, suspend and resume.
-  - Node cordon and uncordon.
+  - Node cordon, uncordon and drain (with progress and cancel).
+  - Flux reconcile, Argo CD refresh.
   - Each one asks first and names the context.
-  - Shell, Edit YAML (`kubectl edit`) and Follow log (`kubectl logs -f`) open in a real terminal split beside the browser.
+  - Pick several rows to restart, scale, delete or merge their logs at once.
+  - Shell, debug container, `kubectl edit`, `kubectl logs -f`, `helm rollback` and `helm uninstall` open in a real terminal split.
 - **Port forwards**
-  - Pods and services, listed in the sidebar with live status.
+  - Pods and services, with live status in the sidebar.
   - A service forward picks a ready pod for each new connection, so it follows pod replacements.
+  - Forwards are saved and can be started again, one by one or all at once.
+- **Staying current**
+  - Watches that keep failing mark the data stale.
+  - When credentials expired, **Sign in** runs kubectl in a terminal so the credential plugin can prompt.
+    **Reconnect** then makes a fresh client.
 - **Navigation**
   - Back and forward history.
   - `g` jumps to a kind.
+  - ⌃K opens Go to.
+  - Every view is saved as it changes, and the plugin reopens the tab after Tern restarts.
 
 ## Install
 
 ```sh
 cargo install --path .        # puts tern-kube in ~/.cargo/bin
-tern plugin link plugin       # the palette command and key bind
+tern plugin link plugin       # the palette command, key bind and reopen-on-restart
 ```
 
 Open the command palette and choose **Open Kubernetes**, or press `⌥⇧⌘K`.
@@ -75,26 +106,33 @@ tern-kube [--context NAME]... [--namespace NAME]
 ```
 
 Give `--context` more than once to merge clusters.
-Shell, Edit and Follow log call `kubectl`, so `kubectl` must be on the pane's `PATH`.
+Terminal actions call `kubectl` (and `helm` for releases), so they must be on the pane's `PATH`.
 Everything else talks to the API servers directly.
 
-## Change protection
+## Configuration
 
-Contexts can be protected or read-only, as in Aptakube.
-
-- **Protected:** a change or a shell first asks to unlock the context for 15 minutes.
-- **Read-only:** changes and shells are refused.
-
-Without a config file, every context with `prod` in its name is protected.
-Edit `~/.config/tern-kube/config.json` to change that:
+`~/.config/tern-kube/config.json`:
 
 ```json
-{ "protected": ["*prod*"], "readonly": ["audit-*"], "unprotected": ["prod-sandbox"] }
+{
+  "protected": ["*prod*"],
+  "readonly": ["audit-*"],
+  "unprotected": ["prod-sandbox"],
+  "contexts": {
+    "gke_acme_us-east4_frontend-production": { "alias": "frontend prod", "color": "red", "tags": ["prod", "gcp"] }
+  }
+}
 ```
 
-Patterns are globs over context names. Matching ignores letter case.
-`unprotected` beats `readonly`, which beats `protected`.
-RBAC still decides what your account may do.
+- `protected`, `readonly` and `unprotected` are globs over context names. Matching ignores letter case.
+  `unprotected` beats `readonly`, which beats `protected`.
+  Without a file, every context with `prod` in its name is protected.
+  RBAC still decides what your account may do.
+- `alias` replaces the context name on screen only. Commands always use the real name.
+- `color` is one of `red`, `orange`, `yellow`, `green`, `blue`, `purple` and `gray`.
+- `tags` group contexts in the context picker.
+
+The last view is saved in `~/.local/state/tern-kube/state.json`: contexts, kind, namespace, open object, port forwards and label columns.
 
 ## Keys
 
@@ -102,24 +140,27 @@ RBAC still decides what your account may do.
 | --- | --- |
 | ↑ ↓ / j k, PgUp PgDn, Home End | Select a row |
 | Enter | Open the detail pane |
-| Esc | Close a menu, dialog or the detail pane, or clear the filter |
+| Space | Pick the row (once a row is picked; Ctrl+Space starts) |
+| Esc | Close a menu or dialog, clear picks, close the detail pane, or clear the filter |
 | / | Filter |
+| ⌃K or : | Go to |
 | [ ] | Previous or next kind |
-| g then p d t a r j o s i c x v n e | Pods, Deployments, StatefulSets, DaemonSets, ReplicaSets, Jobs, CronJobs, Services, Ingresses, ConfigMaps, Secrets, PVCs, Nodes, Events |
+| g then h p d t a r j o l s i c x v n e | Health, Pods, Deployments, StatefulSets, DaemonSets, ReplicaSets, Jobs, CronJobs, Helm, Services, Ingresses, ConfigMaps, Secrets, PVCs, Nodes, Events |
 | ⌥← ⌥→ | Back, forward |
 | Tab, Shift+Tab, 1–4 | Detail tabs (y is YAML) |
 | l | Logs |
 | s | Shell into the pod |
+| Shift+D | Debug container |
 | f | Port forward (pods, services) |
 | Shift+S | Scale |
 | Shift+R | Rollout restart |
 | t | Trigger the CronJob |
-| e | `kubectl edit` |
-| Delete, ⌘⌫ | Delete |
+| e | `kubectl edit` in a split |
+| Shift+E | Edit the YAML in place (⌃S reviews the diff) |
+| = | Compare with another context or namespace |
+| Delete, ⌘⌫ | Delete (the picked rows, if any) |
 | Shift+C | Pick contexts |
 | q, Ctrl+C | Quit |
-
-The last contexts, kind and namespace are saved in `~/.local/state/tern-kube/state.json`.
 
 ## Development
 

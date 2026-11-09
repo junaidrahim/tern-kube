@@ -86,7 +86,7 @@ All five are implemented.
 4. **Several contexts at once:** merged tables with a Context column and a context picker.
 5. **Navigation:** back/forward, `g` jumps, owner links, child pods, aggregated workload logs, port-forward manager.
 
-Open: aggregated CPU/memory for workloads, bulk actions on multi-selected rows, a native YAML editor with diff, Helm and GitOps views.
+6. **Beyond Aptakube's basics (done):** Health page, ⌃K palette, bulk actions, in-place YAML editor with diff and conflict-safe apply, cross-context compare, Helm releases, Argo CD/Flux, CRD printer columns, Secret/ConfigMap views with TLS details, log filter/pause/timestamps, workload metrics, stale and sign-in states, node drain, debug containers, saved port forwards, context aliases/colors/tags, label columns, state saved on every change and reopen after restart.
 
 ## 5. Verification
 
