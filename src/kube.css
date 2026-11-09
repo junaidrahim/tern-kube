@@ -1,0 +1,9 @@
+/* The split fills the main region so the sidebar, list and detail scroll on
+   their own instead of the whole page. A percentage height does not resolve
+   against the region, so the split is pinned to its edges (the region is
+   already a positioning context). Program sheets are confined to the
+   surface, so no surface prefix is needed. */
+.sf-split[data-id="main.layout"] {
+	position: absolute !important;
+	inset: 0 !important;
+}

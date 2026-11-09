@@ -1,0 +1,7 @@
+schema = 1
+id = "tern-kube"
+name = "Kubernetes"
+version = "0.1.0"
+description = "Open tern-kube, a native Kubernetes browser, from the palette."
+icon = "box"
+window = "window.luau"
