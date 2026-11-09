@@ -7,7 +7,11 @@ use kube::api::DynamicObject;
 use serde_json::Value;
 use tern_sdk::ui::Tone;
 
-use crate::{format, kinds::Projector, metrics};
+use crate::{
+	decode, format,
+	kinds::{Kind, PRINTER_IDS, Projector},
+	metrics,
+};
 
 /// A cell value.
 #[derive(Clone, Debug, PartialEq)]
@@ -221,8 +225,68 @@ fn join(values: impl IntoIterator<Item = String>) -> String {
 	values.into_iter().filter(|v| !v.is_empty()).collect::<Vec<_>>().join(", ")
 }
 
-/// Projects `obj` with `projector`.
-pub fn project(projector: Projector, obj: &DynamicObject) -> Row {
+/// The cells of a Helm release secret: the release name, revision, status,
+/// chart and app version, and when it was deployed.
+fn helm_cells(d: &Value) -> Vec<(&'static str, Val)> {
+	let Some(release) = d.pointer("/data/release").and_then(Value::as_str).and_then(|r| decode::helm_release(r).ok())
+	else {
+		return vec![("status", Val::Dot("unreadable".into(), Tone::Error))];
+	};
+	let status = s(&release, &["info", "status"]).to_owned();
+	let tone = match status.as_str() {
+		"deployed" => Tone::Success,
+		"failed" => Tone::Error,
+		"superseded" => Tone::Muted,
+		"uninstalling" => Tone::Warning,
+		_ => Tone::Pending,
+	};
+	let chart = format!(
+		"{}-{}",
+		s(&release, &["chart", "metadata", "name"]),
+		s(&release, &["chart", "metadata", "version"])
+	);
+	vec![
+		("release", st(s(&release, &["name"]))),
+		("revision", n(i(&release, &["version"]))),
+		("status", Val::Dot(status, tone)),
+		("chart", st(chart)),
+		("app_version", st(s(&release, &["chart", "metadata", "appVersion"]))),
+		("updated", age_at(s(&release, &["info", "last_deployed"]))),
+	]
+}
+
+fn printer_cells(kind: &Kind, obj: &DynamicObject) -> Vec<(&'static str, Val)> {
+	if kind.printer.is_empty() {
+		return vec![];
+	}
+	// Paths are relative to the whole object; most only read spec and status.
+	let whole = if kind.printer.iter().any(|p| p.path.contains(".metadata")) {
+		serde_json::to_value(obj).unwrap_or(Value::Null)
+	} else {
+		obj.data.clone()
+	};
+	kind.printer
+		.iter()
+		.zip(PRINTER_IDS)
+		.map(|(p, id)| {
+			let text = decode::jsonpath_text(&whole, &p.path);
+			let v = match p.kind.as_str() {
+				"date" => unix(&text).map_or(Val::Empty, Val::Age),
+				"integer" | "number" => text.parse::<f64>().map_or_else(|_| st(text.clone()), |x| Val::Num(x as i64, text.clone())),
+				_ => match text.as_str() {
+					"True" | "Ready" | "Healthy" | "Synced" => Val::Dot(text, Tone::Success),
+					"False" => Val::Dot(text, Tone::Error),
+					_ => st(text),
+				},
+			};
+			(id, v)
+		})
+		.collect()
+}
+
+/// Projects `obj` with its kind's projector.
+pub fn project(kind: &Kind, obj: &DynamicObject) -> Row {
+	let projector = kind.projector;
 	let meta = &obj.metadata;
 	let name = meta.name.clone().unwrap_or_default();
 	let namespace = meta.namespace.clone();
@@ -450,7 +514,57 @@ pub fn project(projector: Projector, obj: &DynamicObject) -> Row {
 				("replicas", n(i(d, &["status", "currentReplicas"]))),
 			]
 		},
-		Projector::Generic => vec![],
+		Projector::Helm => {
+			let mut v = helm_cells(d);
+			// The release name replaces the secret's name.
+			if let Some((_, release)) = v.iter().find(|(c, _)| *c == "release").cloned() {
+				cells[0].1 = release;
+			}
+			v.retain(|(c, _)| *c != "release");
+			v
+		},
+		Projector::ArgoApp => {
+			let sync = s(d, &["status", "sync", "status"]).to_owned();
+			let health = s(d, &["status", "health", "status"]).to_owned();
+			let sync_tone = if sync == "Synced" { Tone::Success } else { Tone::Warning };
+			let health_tone = match health.as_str() {
+				"Healthy" => Tone::Success,
+				"Progressing" => Tone::Pending,
+				"Suspended" | "Missing" => Tone::Warning,
+				"Degraded" => Tone::Error,
+				_ => Tone::Neutral,
+			};
+			let repo = [s(d, &["spec", "source", "repoURL"]), s(d, &["spec", "sources", "0", "repoURL"])]
+				.into_iter()
+				.find(|x| !x.is_empty())
+				.or_else(|| d.pointer("/spec/sources/0/repoURL").and_then(Value::as_str))
+				.unwrap_or_default();
+			let server = s(d, &["spec", "destination", "server"]);
+			let dest = if server.is_empty() { s(d, &["spec", "destination", "name"]) } else { server };
+			vec![
+				("sync", if sync.is_empty() { Val::Empty } else { Val::Dot(sync, sync_tone) }),
+				("health", if health.is_empty() { Val::Empty } else { Val::Dot(health, health_tone) }),
+				("repo", st(repo)),
+				("dest", st(format!("{dest}/{}", s(d, &["spec", "destination", "namespace"])))),
+			]
+		},
+		Projector::Flux => {
+			let ready = arr(d, &["status", "conditions"]).iter().find(|c| s(c, &["type"]) == "Ready");
+			let status = ready.map_or("Unknown", |c| s(c, &["status"]));
+			let suspended = d.pointer("/spec/suspend").and_then(Value::as_bool).unwrap_or(false);
+			let (text, tone) = match (suspended, status) {
+				(true, _) => ("Suspended", Tone::Warning),
+				(_, "True") => ("True", Tone::Success),
+				(_, "False") => ("False", Tone::Error),
+				_ => ("Unknown", Tone::Pending),
+			};
+			vec![
+				("ready", Val::Dot(text.into(), tone)),
+				("message", st(ready.map_or("", |c| s(c, &["message"])).replace('\n', " "))),
+			]
+		},
+		Projector::Health => vec![],
+		Projector::Generic => printer_cells(kind, obj),
 	};
 	cells.extend(more);
 	cells.push(("age", age));
@@ -495,6 +609,10 @@ mod tests {
 		serde_json::from_value(v).unwrap()
 	}
 
+	fn kind(id: &str) -> Kind {
+		crate::kinds::builtins().into_iter().find(|k| k.id == id).unwrap()
+	}
+
 	#[test]
 	fn crashing_pod_reads_like_kubectl() {
 		let o = obj(serde_json::json!({
@@ -508,7 +626,7 @@ mod tests {
 					"state": {"waiting": {"reason": "CrashLoopBackOff"}}}
 			]}
 		}));
-		let r = project(Projector::Pod, &o);
+		let r = project(&kind("pods"), &o);
 		assert_eq!(r.key, "prod/worker-1");
 		assert_eq!(r.get("ready"), &Val::Num(500, "1/2".into()));
 		assert_eq!(r.get("status"), &Val::Dot("CrashLoopBackOff".into(), Tone::Error));
@@ -551,7 +669,7 @@ mod tests {
 			"involvedObject": {"kind": "Pod", "name": "worker-1"}, "count": 4,
 			"lastTimestamp": "2026-01-01T00:00:10Z"
 		}));
-		let r = project(Projector::Event, &o);
+		let r = project(&kind("events"), &o);
 		assert_eq!(r.get("name"), &Val::Empty);
 		assert_eq!(r.get("object"), &Val::Str("pod/worker-1".into()));
 		assert_eq!(r.get("message"), &Val::Str("Back-off restarting".into()));

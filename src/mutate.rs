@@ -1,15 +1,18 @@
 //! Changes to the cluster: scale, rollout restart, delete, CronJob trigger and
-//! suspend, node cordon. Each is one API call (two for a trigger), made the
+//! suspend, node cordon and drain, and applying edited YAML. Each is made the
 //! way kubectl makes it.
 
+use std::time::Duration;
+
+use k8s_openapi::api::core::v1::Pod;
 use kube::{
 	Client,
-	api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams},
+	api::{Api, ApiResource, DeleteParams, DynamicObject, EvictParams, ListParams, Patch, PatchParams, PostParams},
 };
 use serde_json::{Value, json};
 
 /// A change.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Mutation {
 	/// Set `spec.replicas` through the scale subresource.
 	Scale(i64),
@@ -23,6 +26,14 @@ pub enum Mutation {
 	Suspend(bool),
 	/// Cordon (`true`) or uncordon a node.
 	Cordon(bool),
+	/// `kubectl drain`: cordon, then evict the node's pods (not DaemonSet or
+	/// mirror pods), retrying evictions a disruption budget blocks.
+	Drain,
+	/// Replace the object with an edited one. Its `resourceVersion` makes the
+	/// server refuse it when the object changed meanwhile.
+	Apply(Box<DynamicObject>),
+	/// Set an annotation (Flux reconcile, Argo CD refresh requests).
+	Annotate(String, String),
 }
 
 impl Mutation {
@@ -37,12 +48,17 @@ impl Mutation {
 			Self::Suspend(false) => "Resume".into(),
 			Self::Cordon(true) => "Cordon".into(),
 			Self::Cordon(false) => "Uncordon".into(),
+			Self::Drain => "Drain".into(),
+			Self::Apply(_) => "Apply".into(),
+			Self::Annotate(k, _) if k.starts_with("reconcile.fluxcd.io") => "Reconcile".into(),
+			Self::Annotate(k, _) if k.starts_with("argocd.argoproj.io") => "Refresh".into(),
+			Self::Annotate(..) => "Annotate".into(),
 		}
 	}
 
 	/// Whether it destroys something.
 	pub const fn destructive(&self) -> bool {
-		matches!(self, Self::Delete)
+		matches!(self, Self::Delete | Self::Drain)
 	}
 }
 
@@ -116,8 +132,55 @@ pub fn manual_job_name(cron: &str, now: i64) -> String {
 	format!("{}{suffix}", &cron[..cron.floor_char_boundary(keep)])
 }
 
-/// Runs `m` on `obj`; `Ok` is a short past-tense summary.
-pub async fn run(client: Client, obj: &Object, m: &Mutation) -> Result<String, String> {
+/// Whether a pod stays on a drained node: DaemonSet pods (their controller
+/// ignores cordons), mirror pods, and pods that already finished.
+pub fn drain_skips(pod: &Pod) -> bool {
+	let daemon = pod.metadata.owner_references.iter().flatten().any(|o| o.kind == "DaemonSet");
+	let mirror = pod.metadata.annotations.as_ref().is_some_and(|a| a.contains_key("kubernetes.io/config.mirror"));
+	let done = matches!(pod.status.as_ref().and_then(|s| s.phase.as_deref()), Some("Succeeded" | "Failed"));
+	daemon || mirror || done
+}
+
+async fn drain(client: Client, node: &str, progress: &(dyn Fn(String) + Send + Sync)) -> Result<String, String> {
+	let nodes: Api<k8s_openapi::api::core::v1::Node> = Api::all(client.clone());
+	nodes
+		.patch(node, &PatchParams::default(), &Patch::Merge(json!({"spec": {"unschedulable": true}})))
+		.await
+		.map_err(describe)?;
+	let pods: Api<Pod> = Api::all(client.clone());
+	let list = pods.list(&ListParams::default().fields(&format!("spec.nodeName={node}"))).await.map_err(describe)?;
+	let victims: Vec<Pod> = list.items.into_iter().filter(|p| !drain_skips(p)).collect();
+	let total = victims.len();
+	for (i, p) in victims.iter().enumerate() {
+		let (ns, name) = (p.metadata.namespace.clone().unwrap_or_default(), p.metadata.name.clone().unwrap_or_default());
+		progress(format!("Evicting {}/{total}: {ns}/{name}", i + 1));
+		let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
+		let mut tries = 0;
+		loop {
+			match api.evict(&name, &EvictParams::default()).await {
+				Ok(_) => break,
+				Err(kube::Error::Api(s)) if s.code == 404 => break,
+				// A disruption budget says not now: wait and retry, as kubectl does.
+				Err(kube::Error::Api(s)) if s.code == 429 && tries < 60 => {
+					tries += 1;
+					progress(format!("Waiting on a disruption budget for {ns}/{name}"));
+					tokio::time::sleep(Duration::from_secs(5)).await;
+				},
+				Err(e) => return Err(format!("{ns}/{name}: {}", describe(e))),
+			}
+		}
+	}
+	Ok(format!("Drained node/{node}: {total} pods evicted"))
+}
+
+/// Runs `m` on `obj`; `Ok` is a short past-tense summary. Long changes
+/// (drain) report progress.
+pub async fn run(
+	client: Client,
+	obj: &Object,
+	m: &Mutation,
+	progress: &(dyn Fn(String) + Send + Sync),
+) -> Result<String, String> {
 	let api = obj.api(client.clone());
 	let pp = PatchParams::default();
 	let label = format!("{}/{}", obj.ar.kind.to_lowercase(), obj.name);
@@ -152,6 +215,22 @@ pub async fn run(client: Client, obj: &Object, m: &Mutation) -> Result<String, S
 			let jobs: Api<DynamicObject> = Api::namespaced_with(client, &ns, &jobs_ar);
 			jobs.create(&PostParams::default(), &job).await.map_err(describe)?;
 			Ok(format!("Created job/{name}"))
+		},
+		Mutation::Drain => drain(client, &obj.name, progress).await,
+		Mutation::Annotate(k, v) => {
+			let mut ann = serde_json::Map::new();
+			ann.insert(k.clone(), Value::String(v.clone()));
+			api.patch(&obj.name, &pp, &Patch::Merge(json!({"metadata": {"annotations": ann}}))).await.map_err(describe)?;
+			Ok(format!("{} {label}", m.verb()))
+		},
+		Mutation::Apply(edited) => {
+			api.replace(&obj.name, &PostParams::default(), edited).await.map_err(|e| match e {
+				kube::Error::Api(s) if s.code == 409 => {
+					"The object changed on the server since you started editing. Reload it and edit again.".to_owned()
+				},
+				other => describe(other),
+			})?;
+			Ok(format!("Applied {label}"))
 		},
 	}
 }

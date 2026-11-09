@@ -1,16 +1,21 @@
-//! User configuration: change protection per context, as in Aptakube.
-//! `~/.config/tern-kube/config.json`:
+//! User configuration, `~/.config/tern-kube/config.json`:
 //!
 //! ```json
-//! { "protected": ["*prod*"], "readonly": ["audit-*"], "unprotected": ["dev-prod-sandbox"] }
+//! {
+//!   "protected": ["*prod*"], "readonly": ["audit-*"], "unprotected": ["dev-prod-sandbox"],
+//!   "contexts": { "gke_x_us-east4_frontend-production": { "alias": "frontend prod", "color": "red", "tags": ["prod", "gcp"] } }
+//! }
 //! ```
 //!
-//! Patterns are globs (`*` matches anything) over context names. Without a
-//! file, contexts whose name contains `prod` are protected.
+//! Protection patterns are globs (`*` matches anything) over context names.
+//! Without a file, contexts whose name contains `prod` are protected.
+//! Aliases replace context names on screen only; commands always use the
+//! real name.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::Deserialize;
+use tern_sdk::ui::Tone;
 
 /// How much a context allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +28,18 @@ pub enum Protection {
 	ReadOnly,
 }
 
+/// How a context looks.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ContextLook {
+	/// Shown instead of the name.
+	pub alias: Option<String>,
+	/// `red`, `orange`, `yellow`, `green`, `blue`, `purple` or `gray`.
+	pub color: Option<String>,
+	/// Tags; the context picker toggles every context of a tag at once.
+	pub tags:  Vec<String>,
+}
+
 /// The parsed config file.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -33,11 +50,13 @@ pub struct Config {
 	pub readonly:    Vec<String>,
 	/// Exceptions to both.
 	pub unprotected: Vec<String>,
+	/// Per-context aliases, colors and tags.
+	pub contexts:    BTreeMap<String, ContextLook>,
 }
 
 impl Default for Config {
 	fn default() -> Self {
-		Self { protected: vec!["*prod*".into()], readonly: vec![], unprotected: vec![] }
+		Self { protected: vec!["*prod*".into()], readonly: vec![], unprotected: vec![], contexts: BTreeMap::new() }
 	}
 }
 
@@ -89,6 +108,29 @@ impl Config {
 			Protection::None
 		}
 	}
+
+	/// What `context` is called on screen (its alias, else its name).
+	pub fn display<'a>(&'a self, context: &'a str) -> &'a str {
+		self.contexts.get(context).and_then(|l| l.alias.as_deref()).unwrap_or(context)
+	}
+
+	/// The tone of `context`'s color, if it has one.
+	pub fn tone(&self, context: &str) -> Option<Tone> {
+		Some(match self.contexts.get(context)?.color.as_deref()? {
+			"red" => Tone::Error,
+			"orange" | "yellow" => Tone::Warning,
+			"green" => Tone::Success,
+			"blue" => Tone::Info,
+			"purple" => Tone::Accent,
+			"gray" | "grey" => Tone::Muted,
+			_ => return None,
+		})
+	}
+
+	/// The tags of `context`.
+	pub fn tags(&self, context: &str) -> &[String] {
+		self.contexts.get(context).map_or(&[], |l| l.tags.as_slice())
+	}
 }
 
 #[cfg(test)]
@@ -107,7 +149,12 @@ mod tests {
 
 	#[test]
 	fn exceptions_beat_readonly_beats_protected() {
-		let c = Config { protected: vec!["*prod*".into()], readonly: vec!["*audit*".into()], unprotected: vec!["prod-sandbox".into()] };
+		let c = Config {
+			protected: vec!["*prod*".into()],
+			readonly: vec!["*audit*".into()],
+			unprotected: vec!["prod-sandbox".into()],
+			..Config::default()
+		};
 		assert_eq!(c.protection("eu-prod"), Protection::Protected);
 		assert_eq!(c.protection("prod-audit"), Protection::ReadOnly);
 		assert_eq!(c.protection("prod-sandbox"), Protection::None);

@@ -1,21 +1,46 @@
-//! Preferences kept between runs: the last context, kind and namespace.
+//! Preferences kept between runs: the shown contexts, kind, namespace, the
+//! open object, saved port forwards and chosen label columns. Written on
+//! every change, so a crash or reboot loses nothing.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// A port forward to start again.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedForward {
+	/// Context.
+	pub context:   String,
+	/// Namespace.
+	pub namespace: String,
+	/// `pod` or `service`.
+	pub kind:      String,
+	/// Name.
+	pub name:      String,
+	/// Target port.
+	pub port:      u16,
+	/// Local port.
+	pub local:     u16,
+}
 
 /// What is saved.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Saved {
 	/// Last primary context.
-	pub context:   Option<String>,
+	pub context:       Option<String>,
 	/// Every context shown (the primary first).
-	pub contexts:  Vec<String>,
+	pub contexts:      Vec<String>,
 	/// Last kind id.
-	pub kind:      Option<String>,
+	pub kind:          Option<String>,
 	/// Last namespace filter.
-	pub namespace: Option<String>,
+	pub namespace:     Option<String>,
+	/// The open object's row id.
+	pub detail:        Option<String>,
+	/// Port forwards.
+	pub forwards:      Vec<SavedForward>,
+	/// Label keys shown as columns, by kind id.
+	pub label_columns: BTreeMap<String, Vec<String>>,
 }
 
 fn path() -> Option<PathBuf> {

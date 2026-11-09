@@ -1,11 +1,13 @@
 //! The async side: one kube client per context, list+watch streams,
 //! discovery, log streams, per-object event watches, metrics polls,
-//! mutations and port forwards. It runs on tokio and reports to the UI
-//! thread over a channel, waking its `session.next`.
+//! mutations (with progress and cancel), object fetches and port forwards.
+//! It runs on tokio and reports to the UI thread over a channel, waking its
+//! `session.next`.
 //!
 //! Commands never wait on the network in the command loop: clients are
 //! created once per context inside the tasks that need them, so a slow
-//! credential plugin in one context does not hold up another.
+//! credential plugin in one context does not hold up another. `Reconnect`
+//! drops a context's client (after a sign-in) and restarts its watches.
 
 use std::{
 	collections::HashMap,
@@ -27,6 +29,7 @@ use kube::{
 	discovery::Discovery,
 	runtime::{WatchStreamExt, watcher},
 };
+use serde_json::Value;
 use tern_sdk::Waker;
 use tokio::{
 	sync::{OnceCell, mpsc as tmpsc},
@@ -34,14 +37,14 @@ use tokio::{
 };
 
 use crate::{
-	kinds::{self, Kind},
+	kinds::{self, Kind, PrinterCol},
 	metrics, mutate, portforward,
 };
 
 /// How often metrics are polled (metrics-server scrapes every 15 s).
 const METRICS_EVERY: Duration = Duration::from_secs(15);
-/// Most pods one aggregated log streams at once.
-const MAX_LOG_STREAMS: usize = 12;
+/// Most pods one merged log streams at once.
+const MAX_LOG_STREAMS: usize = 16;
 
 /// What a watch covers.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -57,6 +60,10 @@ pub struct WatchKey {
 /// One container log to stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogSource {
+	/// Context.
+	pub context:   String,
+	/// Namespace.
+	pub namespace: String,
 	/// Pod.
 	pub pod:       String,
 	/// Container (the default one when `None`).
@@ -69,27 +76,30 @@ pub enum Cmd {
 	/// Start listing and watching (no-op when already running).
 	Watch {
 		/// What to watch.
-		key: WatchKey,
+		key:    WatchKey,
 		/// The resource.
-		ar:  ApiResource,
+		ar:     ApiResource,
+		/// A field selector.
+		fields: Option<String>,
 	},
 	/// Stop a watch.
 	Unwatch(WatchKey),
+	/// Forget a context's client (after a sign-in) and restart its watches.
+	Reconnect(String),
 	/// Find custom resource kinds in a context.
 	Discover(String),
 	/// Stream container logs, replacing any other log stream. Several
-	/// sources are merged, each line prefixed with its source.
+	/// sources (pods of a workload, picked pods, even across contexts) are
+	/// merged, each line prefixed with its source.
 	Logs {
 		/// Identifies the stream in updates.
-		id:        u64,
-		/// Context.
-		context:   String,
-		/// Namespace.
-		namespace: String,
+		id:         u64,
 		/// What to stream.
-		sources:   Vec<LogSource>,
+		sources:    Vec<LogSource>,
 		/// The previous instances' logs.
-		previous:  bool,
+		previous:   bool,
+		/// Ask the server for timestamps.
+		timestamps: bool,
 	},
 	/// Stop the log stream.
 	StopLogs,
@@ -119,6 +129,17 @@ pub enum Cmd {
 		/// The change.
 		change:  mutate::Mutation,
 	},
+	/// Stop a running change (a drain).
+	Cancel(u64),
+	/// Fetch one object (for a comparison).
+	Get {
+		/// Identifies the result.
+		id:      u64,
+		/// Context.
+		context: String,
+		/// The object.
+		obj:     mutate::Object,
+	},
 	/// Start a port forward.
 	Forward(portforward::Spec),
 	/// Stop a port forward.
@@ -144,6 +165,8 @@ pub enum WatchEv {
 		message:   String,
 		/// HTTP 403: the account may not list or watch this.
 		forbidden: bool,
+		/// The credentials failed (401, or the exec credential plugin).
+		auth:      bool,
 	},
 }
 
@@ -164,8 +187,12 @@ pub enum Update {
 	Events(u64, WatchEv),
 	/// A metrics snapshot of a context, or why there is none.
 	Metrics(String, Result<metrics::Snapshot, String>),
+	/// A running change's progress.
+	Progress(u64, String),
 	/// A mutation finished.
 	Mutated(u64, Result<String, String>),
+	/// A fetched object.
+	Got(u64, Result<Box<DynamicObject>, String>),
 	/// A port forward reported.
 	Forward(u64, portforward::Report),
 }
@@ -203,13 +230,21 @@ pub fn start(
 
 type ClientCell = Arc<OnceCell<Result<Client, String>>>;
 
+/// A running watch and what restarts it.
+struct Running {
+	task:   JoinHandle<()>,
+	ar:     ApiResource,
+	fields: Option<String>,
+}
+
 struct Backend {
 	kubeconfig: Arc<Kubeconfig>,
 	clients:    HashMap<String, ClientCell>,
-	watches:    HashMap<WatchKey, JoinHandle<()>>,
+	watches:    HashMap<WatchKey, Running>,
 	logs:       Option<JoinHandle<()>>,
 	events:     Option<JoinHandle<()>>,
 	metrics:    HashMap<String, JoinHandle<()>>,
+	changes:    HashMap<u64, JoinHandle<()>>,
 	forwards:   HashMap<u64, JoinHandle<()>>,
 	out:        Outbox,
 }
@@ -222,12 +257,22 @@ async fn run(kubeconfig: Kubeconfig, mut rx: tmpsc::UnboundedReceiver<Cmd>, out:
 		logs: None,
 		events: None,
 		metrics: HashMap::new(),
+		changes: HashMap::new(),
 		forwards: HashMap::new(),
 		out,
 	};
 	while let Some(cmd) = rx.recv().await {
 		b.handle(cmd);
 	}
+}
+
+/// Whether an error message says the credentials failed: an exec credential
+/// plugin that could not get a token, an expired SSO session, or a 401.
+pub fn is_auth_error(message: &str) -> bool {
+	let m = message.to_lowercase();
+	["unauthorized", "(401)", "exec", "credential", "token", "expired", "sso", "login", "authenticat"]
+		.iter()
+		.any(|w| m.contains(w))
 }
 
 fn describe(e: &kube::Error) -> (String, bool) {
@@ -261,10 +306,10 @@ impl Backend {
 		let context = context.to_owned();
 		async move {
 			cell.get_or_init(|| async move {
+				// Re-read the kubeconfig: a sign-in may have rewritten it.
+				let kc = Kubeconfig::read().unwrap_or_else(|_| (*kubeconfig).clone());
 				let opts = KubeConfigOptions { context: Some(context), ..KubeConfigOptions::default() };
-				let config = Config::from_custom_kubeconfig((*kubeconfig).clone(), &opts)
-					.await
-					.map_err(|e| format!("kubeconfig: {e}"))?;
+				let config = Config::from_custom_kubeconfig(kc, &opts).await.map_err(|e| format!("kubeconfig: {e}"))?;
 				Client::try_from(config).map_err(|e| format!("client: {e}"))
 			})
 			.await
@@ -272,26 +317,48 @@ impl Backend {
 		}
 	}
 
+	fn start_watch(&mut self, key: WatchKey, ar: ApiResource, fields: Option<String>) {
+		let client = self.client(&key.context);
+		let (k, a, f, out) = (key.clone(), ar.clone(), fields.clone(), self.out.clone());
+		let task = tokio::spawn(async move {
+			match client.await {
+				Ok(c) => watch(c, a, f, k, out).await,
+				Err(message) => {
+					let auth = is_auth_error(&message);
+					out.send(Update::Watch(k, WatchEv::Error { message, forbidden: false, auth }));
+				},
+			}
+		});
+		if let Some(old) = self.watches.insert(key, Running { task, ar, fields }) {
+			old.task.abort();
+		}
+	}
+
 	fn handle(&mut self, cmd: Cmd) {
 		let out = self.out.clone();
 		match cmd {
-			Cmd::Watch { key, ar } => {
-				if self.watches.get(&key).is_some_and(|h| !h.is_finished()) {
+			Cmd::Watch { key, ar, fields } => {
+				if self.watches.get(&key).is_some_and(|r| !r.task.is_finished()) {
 					return;
 				}
-				let client = self.client(&key.context);
-				let k = key.clone();
-				let task = tokio::spawn(async move {
-					match client.await {
-						Ok(c) => watch(c, ar, k, out).await,
-						Err(message) => {
-							out.send(Update::Watch(k, WatchEv::Error { message, forbidden: false }));
-						},
-					}
-				});
-				self.watches.insert(key, task);
+				self.start_watch(key, ar, fields);
 			},
-			Cmd::Unwatch(key) => abort(self.watches.remove(&key)),
+			Cmd::Unwatch(key) => abort(self.watches.remove(&key).map(|r| r.task)),
+			Cmd::Reconnect(context) => {
+				self.clients.remove(&context);
+				let keys: Vec<(WatchKey, ApiResource, Option<String>)> = self
+					.watches
+					.iter()
+					.filter(|(k, _)| k.context == context)
+					.map(|(k, r)| (k.clone(), r.ar.clone(), r.fields.clone()))
+					.collect();
+				for (k, ar, fields) in keys {
+					self.start_watch(k, ar, fields);
+				}
+				if let Some(h) = self.metrics.remove(&context) {
+					h.abort();
+				}
+			},
 			Cmd::Discover(context) => {
 				let client = self.client(&context);
 				tokio::spawn(async move {
@@ -305,16 +372,29 @@ impl Backend {
 					};
 				});
 			},
-			Cmd::Logs { id, context, namespace, sources, previous } => {
+			Cmd::Logs { id, sources, previous, timestamps } => {
 				abort(self.logs.take());
-				let client = self.client(&context);
+				let mut contexts: Vec<String> = sources.iter().map(|s| s.context.clone()).collect();
+				contexts.sort();
+				contexts.dedup();
+				let mut clients = Vec::with_capacity(contexts.len());
+				for c in &contexts {
+					clients.push((c.clone(), self.client(c)));
+				}
 				self.logs = Some(tokio::spawn(async move {
-					match client.await {
-						Ok(c) => logs(c, namespace, sources, previous, id, out).await,
-						Err(e) => {
-							out.send(Update::LogEnded(id, Some(e)));
-						},
+					let mut ready = HashMap::new();
+					for (c, fut) in clients {
+						match fut.await {
+							Ok(cl) => {
+								ready.insert(c, cl);
+							},
+							Err(e) => {
+								out.send(Update::LogEnded(id, Some(format!("{c}: {e}"))));
+								return;
+							},
+						}
 					}
+					logs(&ready, sources, previous, timestamps, id, out).await;
 				}));
 			},
 			Cmd::StopLogs => abort(self.logs.take()),
@@ -330,7 +410,7 @@ impl Backend {
 			Cmd::StopEvents => abort(self.events.take()),
 			Cmd::Metrics(contexts) => {
 				self.metrics.retain(|ctx, h| {
-					let keep = contexts.contains(ctx);
+					let keep = contexts.contains(ctx) && !h.is_finished();
 					if !keep {
 						h.abort();
 					}
@@ -365,12 +445,42 @@ impl Backend {
 			},
 			Cmd::Mutate { id, context, obj, change } => {
 				let client = self.client(&context);
-				tokio::spawn(async move {
+				let task = tokio::spawn(async move {
+					let progress = {
+						let out = out.clone();
+						move |text: String| {
+							out.send(Update::Progress(id, text));
+						}
+					};
 					let result = match client.await {
-						Ok(c) => mutate::run(c, &obj, &change).await,
+						Ok(c) => mutate::run(c, &obj, &change, &progress).await,
 						Err(e) => Err(e),
 					};
 					out.send(Update::Mutated(id, result));
+				});
+				self.changes.retain(|_, h| !h.is_finished());
+				self.changes.insert(id, task);
+			},
+			Cmd::Cancel(id) => {
+				if let Some(h) = self.changes.remove(&id) {
+					h.abort();
+					out.send(Update::Mutated(id, Err("Cancelled".into())));
+				}
+			},
+			Cmd::Get { id, context, obj } => {
+				let client = self.client(&context);
+				tokio::spawn(async move {
+					let result = match client.await {
+						Ok(c) => {
+							let api: Api<DynamicObject> = match &obj.namespace {
+								Some(ns) => Api::namespaced_with(c, ns, &obj.ar),
+								None => Api::all_with(c, &obj.ar),
+							};
+							api.get(&obj.name).await.map(Box::new).map_err(|e| describe(&e).0)
+						},
+						Err(e) => Err(e),
+					};
+					out.send(Update::Got(id, result));
 				});
 			},
 			Cmd::Forward(spec) => {
@@ -416,7 +526,8 @@ async fn pump(
 			Ok(watcher::Event::Delete(o)) => WatchEv::Delete(o),
 			Err(e) => {
 				let (message, forbidden) = describe_watch(&e);
-				WatchEv::Error { message, forbidden }
+				let auth = !forbidden && is_auth_error(&message);
+				WatchEv::Error { message, forbidden, auth }
 			},
 		};
 		if !emit(ev) {
@@ -425,12 +536,16 @@ async fn pump(
 	}
 }
 
-async fn watch(client: Client, ar: ApiResource, key: WatchKey, out: Outbox) {
+async fn watch(client: Client, ar: ApiResource, fields: Option<String>, key: WatchKey, out: Outbox) {
 	let api: Api<DynamicObject> = match &key.namespace {
 		Some(ns) => Api::namespaced_with(client, ns, &ar),
 		None => Api::all_with(client, &ar),
 	};
-	let stream = watcher(api, config()).default_backoff();
+	let mut cfg = config();
+	if let Some(f) = &fields {
+		cfg = cfg.fields(f);
+	}
+	let stream = watcher(api, cfg).default_backoff();
 	pump(stream, |ev| out.send(Update::Watch(key.clone(), ev))).await;
 }
 
@@ -452,21 +567,30 @@ pub fn log_prefix(i: usize, source: &LogSource) -> String {
 	}
 }
 
-async fn logs(client: Client, namespace: String, sources: Vec<LogSource>, previous: bool, id: u64, out: Outbox) {
+async fn logs(
+	clients: &HashMap<String, Client>,
+	sources: Vec<LogSource>,
+	previous: bool,
+	timestamps: bool,
+	id: u64,
+	out: Outbox,
+) {
 	let merged = sources.len() > 1;
 	let live = Arc::new(AtomicUsize::new(0));
 	let mut set = JoinSet::new();
 	for (i, src) in sources.into_iter().take(MAX_LOG_STREAMS).enumerate() {
+		let Some(client) = clients.get(&src.context) else { continue };
 		let prefix = merged.then(|| log_prefix(i, &src));
 		let lp = LogParams {
 			container: src.container.clone(),
 			follow: !previous,
 			previous,
+			timestamps,
 			// A merged log starts from fewer lines per pod.
 			tail_lines: Some(if merged { 200 } else { 1000 }),
 			..LogParams::default()
 		};
-		let (api, out, live) = (Api::<Pod>::namespaced(client.clone(), &namespace), out.clone(), live.clone());
+		let (api, out, live) = (Api::<Pod>::namespaced(client.clone(), &src.namespace), out.clone(), live.clone());
 		live.fetch_add(1, Ordering::Relaxed);
 		set.spawn(async move {
 			let err = stream_one(&api, &src.pod, &lp, prefix.as_deref(), id, &out).await;
@@ -536,14 +660,60 @@ async fn stream_one(
 	}
 }
 
+/// Printer columns of each CRD, by (group, plural): the served storage
+/// version's priority-0 columns.
+async fn printer_columns(client: &Client) -> HashMap<(String, String), Vec<PrinterCol>> {
+	let crd_ar = ApiResource::from_gvk_with_plural(
+		&kube::api::GroupVersionKind::gvk("apiextensions.k8s.io", "v1", "CustomResourceDefinition"),
+		"customresourcedefinitions",
+	);
+	let api: Api<DynamicObject> = Api::all_with(client.clone(), &crd_ar);
+	let Ok(list) = api.list(&kube::api::ListParams::default()).await else { return HashMap::new() };
+	list.items.iter().map(|crd| (crd_key(&crd.data), crd_printer(&crd.data))).collect()
+}
+
+fn crd_key(d: &Value) -> (String, String) {
+	let s = |p: &str| d.pointer(p).and_then(Value::as_str).unwrap_or_default().to_owned();
+	(s("/spec/group"), s("/spec/names/plural"))
+}
+
+/// The printer columns of a CRD (`obj.data`): its storage version's,
+/// priority 0, at most eight, without the Age column (always shown).
+pub fn crd_printer(d: &Value) -> Vec<PrinterCol> {
+	let versions = d.pointer("/spec/versions").and_then(Value::as_array).cloned().unwrap_or_default();
+	let version = versions
+		.iter()
+		.find(|v| v.get("storage").and_then(Value::as_bool) == Some(true))
+		.or_else(|| versions.first());
+	version
+		.and_then(|v| v.get("additionalPrinterColumns"))
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(|c| {
+			let name = c.get("name")?.as_str()?.to_owned();
+			let path = c.get("jsonPath")?.as_str()?.to_owned();
+			let priority = c.get("priority").and_then(Value::as_i64).unwrap_or(0);
+			let kind = c.get("type").and_then(Value::as_str).unwrap_or("string").to_owned();
+			(priority == 0 && !(name == "Age" && path == ".metadata.creationTimestamp"))
+				.then_some(PrinterCol { name, path, kind, priority })
+		})
+		.take(kinds::PRINTER_IDS.len())
+		.collect()
+}
+
 async fn discover(client: Client) -> Result<Vec<Kind>, kube::Error> {
-	let discovery = Discovery::new(client).run_aggregated().await?;
+	let (discovery, printers) = tokio::join!(Discovery::new(client.clone()).run_aggregated(), printer_columns(&client));
+	let discovery = discovery?;
 	let mut kinds: Vec<Kind> = discovery
 		.groups()
 		.filter(|g| !kinds::is_builtin_group(g.name()))
 		.flat_map(|g| g.recommended_resources())
 		.filter(|(_, caps)| caps.operations.iter().any(|o| o == "watch") && caps.operations.iter().any(|o| o == "list"))
-		.map(|(ar, caps)| kinds::custom(ar, &caps.scope))
+		.map(|(ar, caps)| {
+			let printer = printers.get(&(ar.group.clone(), ar.plural.clone())).cloned().unwrap_or_default();
+			kinds::custom(ar, &caps.scope, printer)
+		})
 		.collect();
 	kinds.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.ar.group.cmp(&b.ar.group)));
 	Ok(kinds)
@@ -555,8 +725,35 @@ mod tests {
 
 	#[test]
 	fn merged_logs_prefix_each_source_with_a_rotating_color() {
-		let s = LogSource { pod: "api-1".into(), container: Some("app".into()) };
+		let s = LogSource {
+			context:   "c".into(),
+			namespace: "n".into(),
+			pod:       "api-1".into(),
+			container: Some("app".into()),
+		};
 		assert_eq!(log_prefix(0, &s), "\x1b[91mapi-1/app\x1b[0m ");
 		assert_eq!(log_prefix(6, &LogSource { container: None, ..s }), "\x1b[91mapi-1\x1b[0m ");
+	}
+
+	#[test]
+	fn crd_printer_columns_come_from_the_storage_version() {
+		let crd = serde_json::json!({"spec": {"group": "x.io", "names": {"plural": "widgets"}, "versions": [
+			{"name": "v1alpha1", "storage": false, "additionalPrinterColumns": [{"name": "Old", "jsonPath": ".a"}]},
+			{"name": "v1", "storage": true, "additionalPrinterColumns": [
+				{"name": "Ready", "type": "string", "jsonPath": ".status.ready"},
+				{"name": "Wide", "type": "string", "jsonPath": ".x", "priority": 1},
+				{"name": "Age", "type": "date", "jsonPath": ".metadata.creationTimestamp"}
+			]}
+		]}});
+		let cols = crd_printer(&crd);
+		assert_eq!(cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Ready"]);
+		assert_eq!(crd_key(&crd), ("x.io".to_owned(), "widgets".to_owned()));
+	}
+
+	#[test]
+	fn auth_failures_are_told_from_other_errors() {
+		assert!(is_auth_error("exec: executable tsh failed with exit code 1"));
+		assert!(is_auth_error("Unauthorized (401)"));
+		assert!(!is_auth_error("connection refused"));
 	}
 }

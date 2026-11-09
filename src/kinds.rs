@@ -1,5 +1,8 @@
 //! The resource kinds the sidebar offers: built-ins with hand-made columns,
-//! plus custom resources found by discovery (Name, Namespace, Age).
+//! custom resources found by discovery (with their CRD printer columns),
+//! Helm releases (decoded from their secrets) and the Health page.
+
+use std::borrow::Cow;
 
 use kube::{
 	api::{ApiResource, GroupVersionKind},
@@ -9,10 +12,16 @@ use kube::{
 /// A sidebar group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Group {
+	/// The Health page.
+	Overview,
 	/// Nodes, namespaces, events.
 	Cluster,
 	/// Pods and their controllers.
 	Workloads,
+	/// Helm releases.
+	Helm,
+	/// Argo CD and Flux.
+	GitOps,
 	/// Services, ingresses, network policies.
 	Network,
 	/// ConfigMaps, secrets.
@@ -27,14 +36,27 @@ pub enum Group {
 
 impl Group {
 	/// Every group, in sidebar order.
-	pub const ALL: [Self; 7] =
-		[Self::Workloads, Self::Network, Self::Config, Self::Storage, Self::Cluster, Self::Access, Self::Custom];
+	pub const ALL: [Self; 10] = [
+		Self::Overview,
+		Self::Workloads,
+		Self::Helm,
+		Self::GitOps,
+		Self::Network,
+		Self::Config,
+		Self::Storage,
+		Self::Cluster,
+		Self::Access,
+		Self::Custom,
+	];
 
 	/// The heading.
 	pub const fn label(self) -> &'static str {
 		match self {
+			Self::Overview => "Overview",
 			Self::Cluster => "Cluster",
 			Self::Workloads => "Workloads",
+			Self::Helm => "Helm",
+			Self::GitOps => "GitOps",
 			Self::Network => "Network",
 			Self::Config => "Config",
 			Self::Storage => "Storage",
@@ -81,17 +103,42 @@ pub enum Projector {
 	Event,
 	/// `autoscaling/v2/HorizontalPodAutoscaler`.
 	Hpa,
-	/// Anything else: Name, Namespace, Age.
+	/// Helm release revisions (secrets of type `helm.sh/release.v1`).
+	Helm,
+	/// Argo CD `Application`.
+	ArgoApp,
+	/// Flux objects with a `Ready` condition (Kustomization, HelmRelease, sources).
+	Flux,
+	/// The Health page (no table).
+	Health,
+	/// Anything else: Name, Namespace, Age, plus CRD printer columns.
 	Generic,
 }
 
-/// A column of a kind's table.
-#[derive(Clone, Copy, Debug)]
+/// A CRD printer column (`additionalPrinterColumns`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrinterCol {
+	/// Header.
+	pub name:     String,
+	/// JSONPath into the object.
+	pub path:     String,
+	/// `integer`, `number`, `date`, `string`, `boolean`.
+	pub kind:     String,
+	/// 0 is shown by default; higher only in wide output.
+	pub priority: i64,
+}
+
+/// Cell ids of printer columns.
+pub const PRINTER_IDS: [&str; 8] = ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7"];
+
+/// A column of a kind's table. Built-in columns borrow `'static` text; CRD
+/// printer columns and label columns own theirs.
+#[derive(Clone, Debug)]
 pub struct ColSpec {
 	/// Id (the cell key).
-	pub id:       &'static str,
+	pub id:       Cow<'static, str>,
 	/// Header.
-	pub head:     &'static str,
+	pub head:     Cow<'static, str>,
 	/// Numbers: end-aligned, mono.
 	pub numeric:  bool,
 	/// Takes the spare width (the name column).
@@ -101,14 +148,15 @@ pub struct ColSpec {
 }
 
 const fn col(id: &'static str, head: &'static str, priority: f64) -> ColSpec {
-	ColSpec { id, head, numeric: false, grow: false, priority }
+	ColSpec { id: Cow::Borrowed(id), head: Cow::Borrowed(head), numeric: false, grow: false, priority }
 }
 
 const fn num(id: &'static str, head: &'static str, priority: f64) -> ColSpec {
-	ColSpec { id, head, numeric: true, grow: false, priority }
+	ColSpec { id: Cow::Borrowed(id), head: Cow::Borrowed(head), numeric: true, grow: false, priority }
 }
 
-const NAME: ColSpec = ColSpec { id: "name", head: "Name", numeric: false, grow: true, priority: 100.0 };
+const NAME: ColSpec =
+	ColSpec { id: Cow::Borrowed("name"), head: Cow::Borrowed("Name"), numeric: false, grow: true, priority: 100.0 };
 const NS: ColSpec = col("namespace", "Namespace", 40.0);
 const AGE: ColSpec = num("age", "Age", 60.0);
 /// The context column of merged tables.
@@ -225,7 +273,13 @@ impl Projector {
 				col("type", "Type", 95.0),
 				col("reason", "Reason", 90.0),
 				col("object", "Object", 85.0),
-				ColSpec { id: "message", head: "Message", numeric: false, grow: true, priority: 100.0 },
+				ColSpec {
+					id:       Cow::Borrowed("message"),
+					head:     Cow::Borrowed("Message"),
+					numeric:  false,
+					grow:     true,
+					priority: 100.0,
+				},
 				num("count", "Count", 30.0),
 				num("last", "Last Seen", 80.0),
 			],
@@ -237,6 +291,24 @@ impl Projector {
 				num("replicas", "Replicas", 90.0),
 				AGE,
 			],
+			Self::Helm => cols![
+				NAME,
+				num("revision", "Revision", 70.0),
+				col("status", "Status", 95.0),
+				col("chart", "Chart", 80.0),
+				col("app_version", "App Version", 50.0),
+				num("updated", "Updated", 60.0),
+			],
+			Self::ArgoApp => cols![
+				NAME,
+				col("sync", "Sync", 95.0),
+				col("health", "Health", 90.0),
+				col("repo", "Source", 40.0),
+				col("dest", "Destination", 50.0),
+				AGE,
+			],
+			Self::Flux => cols![NAME, col("ready", "Ready", 95.0), col("message", "Status", 60.0), AGE],
+			Self::Health => cols![],
 			Self::Generic => cols![NAME, AGE],
 		}
 	}
@@ -257,6 +329,10 @@ pub struct Kind {
 	pub namespaced: bool,
 	/// Its row projector.
 	pub projector:  Projector,
+	/// A field selector its watch uses (Helm: `type=helm.sh/release.v1`).
+	pub fields:     Option<String>,
+	/// CRD printer columns (up to eight, priority 0).
+	pub printer:    Vec<PrinterCol>,
 }
 
 impl Kind {
@@ -265,17 +341,36 @@ impl Kind {
 		if ar.group.is_empty() { ar.plural.clone() } else { format!("{}.{}", ar.plural, ar.group) }
 	}
 
-	/// The columns shown: Namespace goes after Name for namespaced kinds.
+	/// The columns shown: Namespace goes after Name for namespaced kinds, and
+	/// CRD printer columns before Age.
 	pub fn columns(&self) -> Vec<ColSpec> {
 		let base = self.projector.columns();
-		let mut out = Vec::with_capacity(base.len() + 1);
+		let mut out = Vec::with_capacity(base.len() + 1 + self.printer.len());
 		for (i, c) in base.iter().enumerate() {
-			out.push(*c);
+			if c.id == "age" {
+				out.extend(self.printer_columns());
+			}
+			out.push(c.clone());
 			if i == 0 && self.namespaced {
 				out.push(NS);
 			}
 		}
 		out
+	}
+
+	fn printer_columns(&self) -> impl Iterator<Item = ColSpec> + '_ {
+		self.printer.iter().zip(PRINTER_IDS).map(|(p, id)| ColSpec {
+			id: Cow::Borrowed(id),
+			head: Cow::Owned(p.name.clone()),
+			numeric: matches!(p.kind.as_str(), "integer" | "number" | "date"),
+			grow: false,
+			priority: 50.0,
+		})
+	}
+
+	/// A page, not a table (Health).
+	pub fn is_page(&self) -> bool {
+		self.projector == Projector::Health
 	}
 
 	/// Whether the object kind has pods with logs and a shell.
@@ -311,9 +406,18 @@ impl Kind {
 		self.is_pod() || self.selects_pods()
 	}
 
-	/// Shows CPU and memory.
+	/// Shows CPU and memory (workloads sum their pods).
 	pub fn has_metrics(&self) -> bool {
-		matches!(self.projector, Projector::Pod | Projector::Node)
+		matches!(
+			self.projector,
+			Projector::Pod | Projector::Node | Projector::Deployment | Projector::StatefulSet | Projector::DaemonSet
+				| Projector::ReplicaSet
+		)
+	}
+
+	/// Workloads whose metrics are their pods' sum.
+	pub fn sums_pods(&self) -> bool {
+		self.has_metrics() && !matches!(self.projector, Projector::Pod | Projector::Node)
 	}
 }
 
@@ -329,14 +433,29 @@ fn builtin(
 	projector: Projector,
 ) -> Kind {
 	let ar = ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk(g, v, kind), plural);
-	Kind { id: Kind::id_of(&ar), label: label.to_owned(), group, ar, namespaced, projector }
+	Kind {
+		id: Kind::id_of(&ar),
+		label: label.to_owned(),
+		group,
+		ar,
+		namespaced,
+		projector,
+		fields: None,
+		printer: Vec::new(),
+	}
 }
 
 /// The built-in kinds, in sidebar order within their groups.
 pub fn builtins() -> Vec<Kind> {
 	use Group::*;
 	use Projector as P;
+	let mut helm = builtin(Helm, "Releases", "", "v1", "Secret", "secrets", true, P::Helm);
+	helm.id = "helmreleases".into();
+	helm.fields = Some("type=helm.sh/release.v1".into());
+	let mut health = builtin(Overview, "Health", "", "v1", "Namespace", "namespaces", false, P::Health);
+	health.id = "health".into();
 	vec![
+		health,
 		builtin(Workloads, "Pods", "", "v1", "Pod", "pods", true, P::Pod),
 		builtin(Workloads, "Deployments", "apps", "v1", "Deployment", "deployments", true, P::Deployment),
 		builtin(Workloads, "StatefulSets", "apps", "v1", "StatefulSet", "statefulsets", true, P::StatefulSet),
@@ -353,6 +472,17 @@ pub fn builtins() -> Vec<Kind> {
 			"horizontalpodautoscalers",
 			true,
 			P::Hpa,
+		),
+		helm,
+		builtin(
+			Workloads,
+			"Pod Disruption Budgets",
+			"policy",
+			"v1",
+			"PodDisruptionBudget",
+			"poddisruptionbudgets",
+			true,
+			P::Generic,
 		),
 		builtin(Network, "Services", "", "v1", "Service", "services", true, P::Service),
 		builtin(Network, "Ingresses", "networking.k8s.io", "v1", "Ingress", "ingresses", true, P::Ingress),
@@ -392,14 +522,24 @@ pub fn builtins() -> Vec<Kind> {
 	]
 }
 
-/// A discovered custom resource kind.
-pub fn custom(ar: ApiResource, scope: &Scope) -> Kind {
+/// A discovered custom resource kind; Argo CD and Flux kinds get their own
+/// columns and group.
+pub fn custom(ar: ApiResource, scope: &Scope, printer: Vec<PrinterCol>) -> Kind {
+	let projector = match (ar.group.as_str(), ar.kind.as_str()) {
+		("argoproj.io", "Application") => Projector::ArgoApp,
+		(g, _) if g.ends_with(".toolkit.fluxcd.io") => Projector::Flux,
+		_ => Projector::Generic,
+	};
+	let group = if projector == Projector::Generic { Group::Custom } else { Group::GitOps };
 	Kind {
-		id:         Kind::id_of(&ar),
-		label:      ar.kind.clone(),
-		group:      Group::Custom,
+		id: Kind::id_of(&ar),
+		label: ar.kind.clone(),
+		group,
 		namespaced: matches!(scope, Scope::Namespaced),
-		projector:  Projector::Generic,
+		projector,
+		fields: None,
+		// Generic kinds show the CRD's own columns.
+		printer: if projector == Projector::Generic { printer } else { Vec::new() },
 		ar,
 	}
 }

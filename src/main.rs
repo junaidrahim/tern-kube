@@ -8,14 +8,17 @@ mod actions;
 mod app;
 mod backend;
 mod config;
+mod decode;
 mod filter;
 mod format;
+mod health;
 mod kinds;
 mod metrics;
 mod mutate;
 mod portforward;
 mod rows;
 mod state;
+mod textedit;
 mod view;
 
 use std::time::{Duration, Instant};
@@ -106,8 +109,9 @@ fn main() -> Result<()> {
 	session.render(sf, view::view(&mut app, unix_now()))?;
 	let mut last_render = Instant::now();
 	let mut dirty = false;
-	let mut focus_sent = app.focus;
+	let mut focus_sent: Option<&'static str> = None;
 	let mut kind_shown = app.kind.clone();
+	let mut saved_last = app.saved();
 	let tick = Duration::from_secs(5);
 	loop {
 		// Drain backend updates first: one render covers all of them.
@@ -140,10 +144,19 @@ fn main() -> Result<()> {
 			session.render(sf, view::view(&mut app, unix_now()))?;
 			last_render = now;
 			dirty = false;
-			if app.focus != focus_sent {
-				focus_sent = app.focus;
-				let id = (app.focus == app::Focus::Filter).then_some(App::FILTER_ID);
-				session.focus(sf, id)?;
+			let focus = focus_target(&app);
+			if focus != focus_sent {
+				focus_sent = focus;
+				session.focus(sf, focus)?;
+			}
+			if let Some(text) = app.copy.take() {
+				session.write_raw(osc52(&text).as_bytes())?;
+			}
+			// Save on every change, so a crash or reboot restores this view.
+			let saved = app.saved();
+			if saved != saved_last {
+				saved.store();
+				saved_last = saved;
 			}
 			if app.kind != kind_shown {
 				kind_shown = app.kind.clone();
@@ -155,4 +168,26 @@ fn main() -> Result<()> {
 	session.close()?;
 	rt.shutdown_timeout(Duration::from_millis(200));
 	Ok(())
+}
+
+/// The node that should have the keys' caret.
+fn focus_target(app: &App) -> Option<&'static str> {
+	match &app.dialog {
+		Some(app::Dialog::Palette { .. }) => return Some("layer.palette.body.q"),
+		Some(app::Dialog::Compare { .. }) => return Some("layer.cmp.body.ns"),
+		Some(_) => return None,
+		None => {},
+	}
+	match app.focus {
+		app::Focus::List => None,
+		app::Focus::Filter => Some(App::FILTER_ID),
+		app::Focus::LogFilter => Some(App::LOG_FILTER_ID),
+		app::Focus::Editor => Some(App::EDITOR_ID),
+	}
+}
+
+/// OSC 52: put `text` on the system clipboard.
+fn osc52(text: &str) -> String {
+	use base64::{Engine, engine::general_purpose::STANDARD};
+	format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
 }
